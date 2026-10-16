@@ -1,0 +1,208 @@
+# Primitive collision model of Stretch 4 (SE4 francis, Stretch Gripper 4) for the joint
+# trajectory planner. Each shape is attached to a link of the stretch4_kinematics
+# BASE_ROTATE model and posed in that link's frame (meters, radians).
+#
+# Shape types:
+#   box:      size [x, y, z], centered at `center`
+#   cylinder: radius, length, axis along z, centered at `center`
+#   capsule:  radius, length, axis along z, centered at `center`
+#   sphere:   radius, centered at `center`
+# `rpy` (optional) rotates a shape about its center.
+#
+# Sizes were fit to the bounding boxes of the URDF collision meshes.
+
+# Minimum clearance (m) between any two checked shapes, robot or obstacle. The stow pose
+# has only ~6.5 mm between the wrist roll box and the (conservative) arm box, so keep
+# this below that.
+padding: 0.005
+
+shapes:
+  base:
+    link: base_link
+    type: cylinder
+    radius: 0.215
+    length: 0.19
+    center: [0.0, 0.0045, 0.095]
+    # The base rotates in place, so obstacles touching it never change during a plan.
+    check_obstacles: false
+
+  mast:
+    link: mast_link
+    type: box
+    size: [0.076, 0.041, 1.47]
+    center: [0.0, -0.0015, 0.815]
+
+  head:
+    link: head_link
+    type: box
+    size: [0.294, 0.308, 0.10]
+    center: [0.051, 0.098, -0.038]
+
+  lift:
+    link: lift_link
+    type: box
+    size: [0.162, 0.198, 0.172]
+    center: [-0.016, 0.053, 0.031]
+
+  # One box from the back of arm_l0 to the tip of arm_l4. `extend_with` stretches it
+  # along +x by the arm's extension, so its back face stays put and its front face
+  # follows the tip. Uses arm_l0's (largest) cross-section along its whole length.
+  arm:
+    link: arm_l0_link
+    type: box
+    size: [0.2557, 0.094, 0.08]
+    center: [0.08187, 0.0, 0.0]
+    extend_with: arm_joint
+
+  wrist:
+    link: wrist_link
+    type: box
+    size: [0.081, 0.056, 0.069]
+    center: [-0.0125, 0.0, 0.0335]
+
+  wrist_yaw:
+    link: wrist_yaw_link
+    type: box
+    size: [0.056, 0.071, 0.073]
+    center: [0.0, -0.0075, -0.0365]
+
+  wrist_pitch:
+    link: wrist_pitch_link
+    type: box
+    size: [0.071, 0.073, 0.056]
+    center: [0.0075, -0.0365, 0.0]
+
+  # wrist_roll_link plus the wrist camera mounted on it
+  wrist_roll:
+    link: wrist_roll_link
+    type: box
+    size: [0.031, 0.065, 0.108]
+    center: [0.0075, 0.0015, 0.026]
+
+  # The wrist camera alone (it is also inside wrist_roll), for the one pair where the
+  # wrist_roll box is far too conservative: against wrist_yaw.
+  wrist_camera:
+    link: gripper_camera_link
+    type: box
+    size: [0.029, 0.058, 0.038]
+    center: [-0.0115, 0.0, 0.002]
+
+  # The gripper is two boxes: one box at its full-open width all the way back to the
+  # wrist blocks pitching the gripper up past ~45 degrees, which the meshes allow.
+  # Quick-connect plate (the gripper's body)
+  gripper:
+    link: quick_connect_interface_link
+    type: box
+    size: [0.115, 0.064, 0.075]
+    center: [0.0575, 0.0005, -0.0095]
+
+  # Both fingers at full open, from their pivots to the fingertips
+  fingers:
+    link: quick_connect_interface_link
+    type: box
+    size: [0.213, 0.216, 0.036]
+    center: [0.1445, 0.0, 0.0]
+
+# Robot shape pairs checked for self-collision. Base rotation never changes
+# self-collision, so only the wrist and gripper need checking against the rest of the
+# body. Pairs left out either can't touch or are attached to each other.
+self_collision_pairs:
+  - [wrist_yaw, base]
+  - [wrist_yaw, mast]
+  - [wrist_yaw, head]
+  - [wrist_yaw, lift]
+  - [wrist_pitch, base]
+  - [wrist_pitch, mast]
+  - [wrist_pitch, head]
+  - [wrist_pitch, lift]
+  - [wrist_pitch, arm]
+  - [wrist_roll, base]
+  - [wrist_roll, mast]
+  - [wrist_roll, head]
+  - [wrist_roll, lift]
+  - [wrist_roll, arm]
+  - [wrist_roll, wrist]
+  # the wrist camera hits the yaw link when pitched up (negative pitch) and rolled
+  # ~-1 to -2 rad
+  - [wrist_camera, wrist_yaw]
+  - [gripper, base]
+  - [fingers, base]
+  - [gripper, mast]
+  - [fingers, mast]
+  - [gripper, head]
+  - [fingers, head]
+  - [gripper, lift]
+  - [fingers, lift]
+  - [gripper, arm]
+  - [fingers, arm]
+  - [gripper, wrist]
+  - [fingers, wrist]
+  - [gripper, wrist_yaw]
+  - [fingers, wrist_yaw]
+
+# Overrides for the URDF joint limits (the URDF's wrist limits are placeholders). When
+# the planner node can reach the driver, the driver's joint_limit.* parameters are used
+# for any joint not listed here.
+joint_limits:
+  mobile_base_rotation_joint: [-3.14159, 3.14159]
+
+# Pose the template stage moves through: arm retracted, wrist stowed (the stretch4_body
+# Stretch Gripper 4 stow pose).
+stow:
+  arm_joint: 0.0
+  wrist_yaw_joint: 3.14
+  wrist_pitch_joint: 0.0
+  wrist_roll_joint: 0.0
+
+planner:
+  # Largest step (m or rad) per joint between collision checks along a motion.
+  check_resolution:
+    mobile_base_rotation_joint: 0.01
+    lift_joint: 0.01
+    arm_joint: 0.01
+    wrist_yaw_joint: 0.03
+    wrist_pitch_joint: 0.03
+    wrist_roll_joint: 0.03
+  # Weight of each joint in the RRT's distance metric (roughly meters of motion per
+  # unit of the joint).
+  distance_weights:
+    mobile_base_rotation_joint: 0.6
+    lift_joint: 1.0
+    arm_joint: 1.0
+    wrist_yaw_joint: 0.15
+    wrist_pitch_joint: 0.15
+    wrist_roll_joint: 0.05
+  rrt_step: 0.15
+  rrt_goal_bias: 0.1
+  default_timeout: 2.0
+  # A start that is inside the padding but not touching anything (e.g. stopped a little
+  # past the stow pose) first moves out of it: the planner tries escape_samples random
+  # small moves at each of these sizes (weighted joint distance), nearest first.
+  escape_radii: [0.01, 0.02, 0.05, 0.1]
+  escape_samples: 30
+
+# Speed (m/s or rad/s) and acceleration limits used to time the trajectory. Kept well
+# below the hardware limits.
+timing:
+  max_velocity:
+    mobile_base_rotation_joint: 0.5
+    lift_joint: 0.15
+    arm_joint: 0.15
+    wrist_yaw_joint: 1.0
+    wrist_pitch_joint: 1.0
+    wrist_roll_joint: 1.0
+  max_acceleration:
+    mobile_base_rotation_joint: 0.5
+    lift_joint: 0.3
+    arm_joint: 0.3
+    wrist_yaw_joint: 2.0
+    wrist_pitch_joint: 2.0
+    wrist_roll_joint: 2.0
+  # Largest step (m or rad) per joint between output waypoints.
+  waypoint_spacing:
+    mobile_base_rotation_joint: 0.1
+    lift_joint: 0.05
+    arm_joint: 0.05
+    wrist_yaw_joint: 0.2
+    wrist_pitch_joint: 0.2
+    wrist_roll_joint: 0.2

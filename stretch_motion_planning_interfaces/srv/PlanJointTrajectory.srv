@@ -1,0 +1,34 @@
+# Plan a collision-free joint trajectory for Stretch 4's base rotation, lift, arm and wrist.
+#
+# Joints use the driver's command names: mobile_base_rotation_joint, lift_joint, arm_joint,
+# wrist_yaw_joint, wrist_pitch_joint, wrist_roll_joint. mobile_base_rotation_joint is
+# relative to the base's heading at the start of the trajectory, so it always starts at 0.
+
+# Start state. Joints left out are filled in from /joint_states. Leave empty to plan from
+# the robot's current state.
+sensor_msgs/JointState start
+
+# Goal positions. Joints left out keep their start position. The base only rotates if
+# mobile_base_rotation_joint is given here.
+sensor_msgs/JointState goal
+
+# Obstacles to avoid, one pose per primitive, in obstacle_frame. An empty obstacle_frame
+# means base_footprint at the start state. A floor at z = 0 is always included.
+string obstacle_frame
+shape_msgs/SolidPrimitive[] obstacles
+geometry_msgs/Pose[] obstacle_poses
+
+# Also avoid the collision objects in MoveIt's planning scene (/get_planning_scene).
+bool use_planning_scene
+
+# Seconds to search before giving up; 0 uses the node's default.
+float64 timeout
+---
+bool success
+string message
+# Which planning stage found the path: "direct", "template" or "rrt".
+string method
+float64 planning_time
+# Positions and time_from_start only. mobile_base_rotation_joint is included only if the
+# base rotates.
+trajectory_msgs/JointTrajectory trajectory
