@@ -139,11 +139,23 @@ class TrajectoryPlannerNode(Node):
             return
         values = dict(zip(names, (rclpy.parameter.parameter_value_to_python(v) for v in future.result().values)))
         limits = {}
+        missing = []
         for joint in DRIVER_LIMIT_JOINTS:
+            if joint in self.configured_limit_joints:
+                continue
             lower, upper = values[f"joint_limit.{joint}.lower"], values[f"joint_limit.{joint}.upper"]
-            if joint not in self.configured_limit_joints and lower is not None and upper is not None:
+            if lower is None or upper is None:
+                missing.append(joint)
+            else:
                 limits[joint] = [lower, upper]
         self.collision.set_joint_limits(limits)
+        if missing:
+            # e.g. the driver declares the parameters before it has values (not homed yet, or
+            # an older driver); keep asking until it has them all.
+            self.get_logger().warn(f"The driver has no joint limits yet for {missing}; using the "
+                                   "config and URDF limits for those and asking again",
+                                   throttle_duration_sec=30.0)
+            return
         self.driver_limits_timer.cancel()
         self.get_logger().info(f"Using the driver's joint limits: {limits}")
 
