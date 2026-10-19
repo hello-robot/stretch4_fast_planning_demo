@@ -1,0 +1,171 @@
+// The obstacle grid: LiDAR frames in, one label per voxel and box-count tables out.
+//
+// Labels come from the latest frame of every LiDAR:
+//   kOccupied            a return from something that isn't the robot or the floor, which
+//                        no newer frame from another LiDAR sees through
+//   kSelf                the robot's own body
+//   kFree                some LiDAR's rays went past it
+//   kShadow              hidden only by the robot (mostly under the arm); probably free
+//   kContaminatedShadow  shadow within contamination_reach of unknown space or an obstacle,
+//                        which a person could be reaching in from, so it counts as possibly
+//                        occupied
+//   kUnknown             hidden by something else, or not seen at all
+// "Unsafe" means unknown or contaminated shadow: the robot moves through it only at contact
+// speed.
+
+#pragma once
+
+#include <array>
+#include <cstdint>
+#include <memory>
+#include <utility>
+#include <vector>
+
+#include "stretch_obstacle_grid/cylindrical_grid.hpp"
+#include "stretch_obstacle_grid/lidar.hpp"
+#include "stretch_obstacle_grid/self_model.hpp"
+#include "stretch_obstacle_grid/volume_table.hpp"
+
+namespace stretch_obstacle_grid
+{
+
+enum Label : uint8_t
+{
+  kFree = 0,
+  kOccupied = 1,
+  kSelf = 2,
+  kShadow = 3,
+  kContaminatedShadow = 4,
+  kUnknown = 5,
+};
+
+struct ObstacleGridParams
+{
+  float self_point_padding = 0.03f;  // m: returns this close to the robot's shapes are the robot
+  float self_voxel_padding = 0.01f;  // m: voxels whose centers are this close are the robot
+  float range_margin = 0.02f;        // m: range noise allowance when comparing rays to voxels
+  int dropout_min_neighbors = 4;     // see RangeImage::fill_dropouts; 9 turns filling off
+  // The robot's dark, glossy covers often return nothing. An empty ray whose path hits the
+  // robot's shapes counts as hitting the robot there, so it hides what's behind as shadow
+  // rather than leaving it unknown.
+  bool empty_rays_hit_self = true;
+  // How far (m) contamination reaches into a shadow from where the shadow touches unknown
+  // space or an obstacle: a hidden person has to connect to something visible within about
+  // a body part's length. Infinity contaminates the whole connected shadow.
+  float contamination_reach = 0.20f;
+  int table_threads = 8;  // OpenMP threads for building the box-count tables
+  // In dual-return mode the Hesai repeats each firing's points, identical 99.9% of the time.
+  // A point bitwise identical to the one this many points earlier is skipped; set it to the
+  // ring count for dual-return frames, 0 to keep every point.
+  int duplicate_stride = 0;
+  // Small clusters of returns (reflections and speckle, mostly around the gripper) count as
+  // no return. Returns in neighboring range image cells belong to the same cluster when
+  // they're within cluster_radius + cluster_radius_per_m * range of each other (neighboring
+  // beams spread apart with range, about 2 cm at 1.5 m); clusters of fewer than
+  // min_cluster_size returns are dropped. 1 keeps everything.
+  float cluster_radius = 0.03f;        // m
+  float cluster_radius_per_m = 0.02f;  // m per m of range
+  int min_cluster_size = 5;
+  // Clusters must also span this many rings: some single rings return lines of points well
+  // off the surface the rings around them see (a channel misreading). Anything the size of
+  // a hand spans several rings (0.7 deg apart); a thin horizontal cord might not.
+  int min_cluster_rings = 2;
+  // Veil points ("mixed pixels"): a beam that clips an edge returns a range between the edge
+  // and what's behind it, drawing a dim streak of fake points behind every edge. A return is
+  // dropped when a nearer neighboring return lies within veil_angle of straight along its
+  // beam, i.e. the two are stacked in depth rather than side by side on a surface. Real edges
+  // (the nearer returns) are kept. 0 turns this off.
+  float veil_angle = 0.1745f;  // rad (10 deg)
+  // Returns nearer than this (m) count as no return: the Hesai's near field is unreliable,
+  // and only the robot's own head and mast are this close to the LiDARs.
+  float min_return_range = 0.35f;
+};
+
+// Milliseconds spent in each step of the last add_frame and update.
+struct Timing
+{
+  double bin_points = 0.0;
+  double self_voxels = 0.0;
+  double label = 0.0;
+  double contaminate = 0.0;
+  double tables = 0.0;
+};
+
+class ObstacleGrid
+{
+public:
+  ObstacleGrid(
+    const GridConfig & config, const std::vector<LidarModel> & lidars,
+    const ObstacleGridParams & params = ObstacleGridParams());
+  // The tables refer to grid_, so the grid can't be copied or moved.
+  ObstacleGrid(const ObstacleGrid &) = delete;
+  ObstacleGrid & operator=(const ObstacleGrid &) = delete;
+
+  const CylindricalGrid & grid() const {return grid_;}
+  int lidar_count() const {return static_cast<int>(lidars_.size());}
+  static constexpr int kMaxLidars = 8;  // occupancy is tracked per LiDAR in a byte
+
+  // The parts of the robot that never move relative to the base (base, mast, head), set once.
+  // They're rasterized here, so the SelfModel passed to add_frame and update only needs the
+  // moving parts. Both count as the robot everywhere.
+  void set_static_self(const SelfModel & self);
+
+  // Take in one frame from LiDAR `lidar`: n points in that LiDAR's frame (non-finite where
+  // there was no return), their ring indices, the frame's start time (s), and the robot's
+  // body during the frame. Replaces that LiDAR's previous frame.
+  void add_frame(
+    int lidar, const float * xyz, const uint16_t * ring, size_t n, double stamp, const SelfModel & self);
+
+  // Relabel every voxel from the latest frames, with the robot's body as it is now, and
+  // rebuild the tables.
+  void update(const SelfModel & self);
+
+  const std::vector<uint8_t> & labels() const {return labels_;}
+  uint32_t count_occupied(const CylinderBox & box) const {return occupied_table_.count(box);}
+  uint32_t count_unsafe(const CylinderBox & box) const {return unsafe_table_.count(box);}
+
+  // Start time of the oldest frame behind the current labels: obstacles may have moved
+  // since then, which the caller pads for.
+  double oldest_stamp() const;
+
+  const RangeImage & range_image(int lidar) const {return frames_[lidar].image;}
+  RayView ray_view(int lidar, size_t voxel) const;
+  const Timing & timing() const {return timing_;}
+
+private:
+  struct Frame
+  {
+    RangeImage image;
+    std::vector<size_t> occupied;  // voxels holding a return from something other than the robot
+    double stamp = -1.0;
+  };
+
+  Label label_voxel(size_t voxel) const;
+  void contaminate_shadows();
+  bool is_self(const SelfModel & moving, const Eigen::Vector3f & p) const;
+  void drop_small_clusters(const float * xyz, const Eigen::Isometry3f & base_from_lidar, int rows, int cols);
+  void drop_veil_points(const float * xyz, int rows, int cols);
+
+  CylindricalGrid grid_;
+  ObstacleGridParams params_;
+  std::vector<LidarModel> lidars_;
+  std::vector<std::unique_ptr<RayTable>> rays_;
+  std::vector<Frame> frames_;
+
+  SelfModel static_self_;
+  std::vector<uint8_t> static_self_flags_;            // static_self_ rasterized
+  std::vector<uint8_t> self_flags_;    // scratch for update(): the robot's body now
+  std::vector<uint8_t> occupied_by_;   // scratch for update(): bit i set if LiDAR i's frame has a return here
+  // Scratch for add_frame: each range image cell's nearest return (point index, or -1), and
+  // the clusters they form (union-find parents and sizes, per cell).
+  std::vector<int32_t> nearest_in_cell_;
+  std::vector<uint32_t> cluster_parent_, cluster_size_;
+  std::vector<uint16_t> cluster_row_min_, cluster_row_max_;
+  std::vector<uint8_t> floor_cell_;  // per cell: its return is on the floor
+  std::vector<uint8_t> veil_flags_;  // per cell: its return is a veil point
+  std::vector<uint8_t> labels_;
+  VolumeTable occupied_table_, unsafe_table_;
+  Timing timing_;
+};
+
+}  // namespace stretch_obstacle_grid
