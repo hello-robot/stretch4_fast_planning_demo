@@ -5,6 +5,7 @@
 #include <chrono>
 #include <cmath>
 #include <deque>
+#include <omp.h>
 #include <limits>
 #include <stdexcept>
 
@@ -94,9 +95,16 @@ void ObstacleGrid::add_frame(
   }
   // Small clusters first: a stray return would otherwise mark its real neighbors behind it
   // as veil points.
+  timing_.nearest = ms_since(start);
+  auto step = Clock::now();
   drop_small_clusters(xyz, base_from_lidar, rows, cols);
+  timing_.clusters = ms_since(step);
+  step = Clock::now();
 
-  // What each return hit.
+  // What each return hit. Cells are independent, and testing returns against the robot's
+  // shapes is most of the cost.
+  const int threads = params_.threads > 0 ? params_.threads : omp_get_max_threads();
+  #pragma omp parallel for schedule(dynamic, 512) num_threads(threads)
   for (size_t cell = 0; cell < nearest_in_cell_.size(); ++cell) {
     const int32_t i = nearest_in_cell_[cell];
     if (i < 0) {
@@ -125,6 +133,8 @@ void ObstacleGrid::add_frame(
     frame.image.hit[cell] = what;
   }
   // Veil points next, since a ghost behind the robot isn't an edge that makes them.
+  timing_.classify = ms_since(step);
+  step = Clock::now();
   drop_veil_points(xyz, rows, cols, &frame.image);
   for (size_t cell = 0; cell < nearest_in_cell_.size(); ++cell) {
     const int32_t i = nearest_in_cell_[cell];
@@ -136,8 +146,11 @@ void ObstacleGrid::add_frame(
       }
     }
   }
+  timing_.veil = ms_since(step);
+  step = Clock::now();
   if (params_.empty_rays_hit_self) {
     const Eigen::Vector3f origin = base_from_lidar.translation();
+    #pragma omp parallel for schedule(dynamic, 4) num_threads(threads)
     for (int row = 0; row < rays.rows(); ++row) {
       for (int col = 0; col < rays.cols(); ++col) {
         const size_t cell = static_cast<size_t>(row) * rays.cols() + col;
@@ -157,6 +170,7 @@ void ObstacleGrid::add_frame(
     }
   }
   frame.image.fill_dropouts(params_.dropout_min_neighbors);
+  timing_.empty_rays = ms_since(step);
   timing_.bin_points = ms_since(start);
 }
 
@@ -169,6 +183,8 @@ void ObstacleGrid::drop_veil_points(const float * xyz, int rows, int cols, Range
   const float cos_angle = std::cos(params_.veil_angle);
   std::vector<float> & veil = veil_range_;
   veil.assign(nearest_in_cell_.size(), std::numeric_limits<float>::quiet_NaN());
+  // Each cell only writes its own flag.
+  #pragma omp parallel for schedule(dynamic, 4) num_threads(params_.threads > 0 ? params_.threads : omp_get_max_threads())
   for (int row = 0; row < rows; ++row) {
     for (int col = 0; col < cols; ++col) {
       const int32_t a = nearest_in_cell_[row * cols + col];
@@ -464,7 +480,8 @@ void ObstacleGrid::update(const SelfModel & self, const Eigen::Isometry3f & worl
   timing_.self_voxels = ms_since(start);
 
   start = Clock::now();
-  #pragma omp parallel for schedule(dynamic, 4096)
+  const int threads = params_.threads > 0 ? params_.threads : omp_get_max_threads();
+  #pragma omp parallel for schedule(dynamic, 4096) num_threads(threads)
   for (size_t voxel = 0; voxel < labels_.size(); ++voxel) {
     labels_[voxel] = label_voxel(voxel);
   }

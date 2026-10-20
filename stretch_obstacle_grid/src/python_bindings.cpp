@@ -153,6 +153,7 @@ PYBIND11_MODULE(stretch_obstacle_grid, m)
   .def_readwrite("static_cell", &ObstacleGridParams::static_cell)
   .def_readwrite("static_gap", &ObstacleGridParams::static_gap)
   .def_readwrite("table_threads", &ObstacleGridParams::table_threads)
+  .def_readwrite("threads", &ObstacleGridParams::threads)
   .def_readwrite("duplicate_stride", &ObstacleGridParams::duplicate_stride)
   .def_readwrite("cluster_radius", &ObstacleGridParams::cluster_radius)
   .def_readwrite("cluster_radius_per_m", &ObstacleGridParams::cluster_radius_per_m)
@@ -228,6 +229,11 @@ PYBIND11_MODULE(stretch_obstacle_grid, m)
       const Timing & t = g.timing();
       py::dict d;
       d["bin_points"] = t.bin_points;
+      d["nearest"] = t.nearest;
+      d["clusters"] = t.clusters;
+      d["classify"] = t.classify;
+      d["veil"] = t.veil;
+      d["empty_rays"] = t.empty_rays;
       d["self_voxels"] = t.self_voxels;
       d["label"] = t.label;
       d["contaminate"] = t.contaminate;

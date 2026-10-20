@@ -15,9 +15,12 @@ Outputs:
   obstacle_grid/{occupied,static,shadow,contaminated} with publish_labels, as grid_viz_node.py
       does (for RViz; costs a few ms per frame)
 
-The grid updates on every frame from either LiDAR (each sweeps at 10 Hz, about 35 ms apart).
-Each LiDAR's subscription keeps only its newest frame, so frames that arrive while the grid is
-busy are dropped (and counted) rather than queued behind it.
+Every frame from either LiDAR (each sweeps at 10 Hz, about 35 ms apart) goes into the grid as
+it arrives. The labels and tables are rebuilt after every frame, or with
+update_every_frame:=false once every LiDAR has sent a new frame (about half the work, but the
+first LiDAR's frame waits for the second's). Each LiDAR's subscription keeps only its newest
+frame, so frames that arrive while the grid is busy are dropped (and counted) rather than
+queued behind it.
 
 Parameters:
   latency (0.15): s from a check's answer to the robot starting to slow (the braking test
@@ -27,14 +30,22 @@ Parameters:
   stale_after (0.5): s; a check fails if the oldest frame behind the grid is older than this
       (a LiDAR stopped), so the server treats everything as unknown.
   contamination_reach (0.2), static_after (3.0): see ObstacleGridParams.
+  update_every_frame (true): see above.
+  threads (0): OpenMP threads for the grid's parallel loops, 0 for every core. Idle threads
+      sleep (OMP_WAIT_POLICY=passive), so they don't take CPU from the drivers between loops.
   publish_labels (false), report_period (5.0)
   calibration_file (""): a stretch_calibration_values.yaml with LiDAR joint origins to use
       instead of TF's mounts, for bags recorded before the robot was calibrated.
 """
 
 import collections
+import os
 import threading
 import time
+
+# OpenMP's worker threads spin between parallel loops by default, taking CPU the LiDAR driver
+# needs. Must be set before the grid module loads.
+os.environ.setdefault("OMP_WAIT_POLICY", "passive")
 
 import numpy as np
 import rclpy
@@ -60,6 +71,7 @@ FRAME_DURATION = 0.1  # s per LiDAR sweep
 # Only the newest frame: an old one is worth less than the time it takes.
 NEWEST_FRAME_ONLY = QoSProfile(history=HistoryPolicy.KEEP_LAST, depth=1, reliability=ReliabilityPolicy.BEST_EFFORT)
 DEBUG_LABELS = ("occupied", "static", "shadow", "contaminated")
+ADD_FRAME_STEPS = ("bin_points", "nearest", "clusters", "classify", "veil", "empty_rays")
 
 
 def stamp_seconds(stamp):
@@ -100,6 +112,8 @@ class ObstacleMonitor(Node):
         super().__init__("obstacle_monitor")
         self.reach = self.declare_parameter("contamination_reach", 0.2).value
         self.static_after = self.declare_parameter("static_after", 3.0).value
+        self.threads = self.declare_parameter("threads", 0).value
+        self.update_every_frame = self.declare_parameter("update_every_frame", True).value
         self.stale_after = self.declare_parameter("stale_after", 0.5).value
         self.publish_labels = self.declare_parameter("publish_labels", False).value
         report_period = self.declare_parameter("report_period", 5.0).value
@@ -129,6 +143,8 @@ class ObstacleMonitor(Node):
         self.world_from_base = np.eye(4, dtype=np.float32)
         self.headings = collections.deque(maxlen=200)  # (stamp, yaw) from odometry, for theta slack
         self.last_stamp = {}
+        self.pending = {}  # LiDAR topic -> sweep end of its frame added since the last update
+        self.last_update = None  # sweep end of the newest frame in the last update
         self.stats = Stats()
 
         sensors = ReentrantCallbackGroup()
@@ -184,18 +200,26 @@ class ObstacleMonitor(Node):
         unpacked = time.perf_counter()
         moving, _, _ = self.robot.moving_model(self.joint_state)
         posed = time.perf_counter()
+        sweep_end = stamp + FRAME_DURATION
+        self.pending[topic] = sweep_end
+        relabel = (self.update_every_frame or len(self.pending) == len(self.topics) or
+                   self.last_update is None or sweep_end - self.last_update > 1.5 * FRAME_DURATION)
         with self.lock:
             locked = time.perf_counter()
             self.grid.add_frame(self.topics.index(topic), xyz, ring, stamp, moving)
-            bin_ms = self.grid.timing()["bin_points"]
-            self.grid.update(moving, self.world_from_base)
-            steps = self.grid.timing()
+            if relabel:
+                self.grid.update(moving, self.world_from_base)
+            # update() leaves add_frame's timings alone; its own are stale unless it just ran.
+            steps = {k: v for k, v in self.grid.timing().items() if relabel or k in ADD_FRAME_STEPS}
         done = self.now()
-        sweep_end = stamp + FRAME_DURATION
         self.stats.add(delivery=received - sweep_end, grid_update=time.perf_counter() - start,
-                       sweep_end_to_grid_ready=done - sweep_end, update_unpack=unpacked - start,
-                       update_pose=posed - unpacked, update_wait_for_check=locked - posed,
-                       **{f"update_{k}": (bin_ms if k == "bin_points" else v) * 1e-3 for k, v in steps.items()})
+                       update_unpack=unpacked - start, update_pose=posed - unpacked,
+                       update_wait_for_check=locked - posed, **{f"update_{k}": v * 1e-3 for k, v in steps.items()})
+        if relabel:
+            # From the end of the oldest sweep not yet in the labels.
+            self.stats.add(sweep_end_to_grid_ready=done - min(self.pending.values()))
+            self.last_update = sweep_end
+            self.pending.clear()
         if self.publish_labels:
             labels = self.grid.labels()
             header = Header(stamp=msg.header.stamp, frame_id=GRID_FRAME)
@@ -214,7 +238,8 @@ class ObstacleMonitor(Node):
             return
         grid, _ = make_grid(mounts, [self.first_clouds[t] for t in self.topics], level=False,
                             contamination_reach=self.reach, log=self.get_logger().info,
-                            overrides={"static_after": self.static_after})
+                            overrides={"static_after": self.static_after, "threads": self.threads,
+                                       **({"table_threads": self.threads} if self.threads else {})})
         self.centers = grid.grid.centers() if self.publish_labels else None
         self.grid = grid
         self.get_logger().info(f"Grid ready ({grid.grid.size:,} voxels); serving check_motion")

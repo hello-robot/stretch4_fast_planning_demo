@@ -75,6 +75,7 @@ struct ObstacleGridParams
   float static_cell = 0.05f;
   float static_gap = 0.5f;
   int table_threads = 8;  // OpenMP threads for building the box-count tables
+  int threads = 0;        // OpenMP threads for the per-return and per-voxel loops (0: default)
   // In dual-return mode the Hesai repeats each firing's points, identical 99.9% of the time.
   // A point bitwise identical to the one this many points earlier is skipped; set it to the
   // ring count for dual-return frames, 0 to keep every point.
@@ -107,7 +108,12 @@ struct ObstacleGridParams
 // Milliseconds spent in each step of the last add_frame and update.
 struct Timing
 {
-  double bin_points = 0.0;
+  double bin_points = 0.0;  // all of add_frame; the steps below add up to it
+  double nearest = 0.0;     // nearest return per range image cell
+  double clusters = 0.0;    // dropping small clusters
+  double classify = 0.0;    // what each return hit
+  double veil = 0.0;        // veil points, and binning occupancy
+  double empty_rays = 0.0;  // empty rays toward the robot, and filling dropouts
   double self_voxels = 0.0;
   double label = 0.0;
   double contaminate = 0.0;
