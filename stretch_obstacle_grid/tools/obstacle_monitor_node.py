@@ -16,7 +16,8 @@ Outputs:
       does (for RViz; costs a few ms per frame)
 
 The grid updates on every frame from either LiDAR (each sweeps at 10 Hz, about 35 ms apart).
-Frames that arrive while the grid is busy are dropped, keeping only the newest, and counted.
+Each LiDAR's subscription keeps only its newest frame, so frames that arrive while the grid is
+busy are dropped (and counted) rather than queued behind it.
 
 Parameters:
   latency (0.15): s from a check's answer to the robot starting to slow (the braking test
@@ -43,7 +44,7 @@ from nav_msgs.msg import Odometry
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup, ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
-from rclpy.qos import qos_profile_sensor_data
+from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
 from rclpy.time import Time
 from sensor_msgs.msg import JointState, PointCloud2
 from std_msgs.msg import Header
@@ -56,6 +57,8 @@ from stretch_motion_planning.collision_model import JOINT_NAMES
 from stretch_motion_planning_interfaces.srv import CheckMotion
 
 FRAME_DURATION = 0.1  # s per LiDAR sweep
+# Only the newest frame: an old one is worth less than the time it takes.
+NEWEST_FRAME_ONLY = QoSProfile(history=HistoryPolicy.KEEP_LAST, depth=1, reliability=ReliabilityPolicy.BEST_EFFORT)
 DEBUG_LABELS = ("occupied", "static", "shadow", "contaminated")
 
 
@@ -134,7 +137,7 @@ class ObstacleMonitor(Node):
         clouds = MutuallyExclusiveCallbackGroup()
         for topic in self.topics:
             self.create_subscription(PointCloud2, topic, lambda msg, t=topic: self.on_cloud(t, msg),
-                                     qos_profile_sensor_data, callback_group=clouds)
+                                     NEWEST_FRAME_ONLY, callback_group=clouds)
         self.create_service(CheckMotion, "check_motion", self.check_motion,
                             callback_group=MutuallyExclusiveCallbackGroup())
         self.timing_pub = self.create_publisher(DiagnosticArray, "obstacle_grid/timing", 1)
@@ -178,14 +181,21 @@ class ObstacleMonitor(Node):
 
         start = time.perf_counter()
         xyz, ring = cloud_fields(msg)
+        unpacked = time.perf_counter()
         moving, _, _ = self.robot.moving_model(self.joint_state)
+        posed = time.perf_counter()
         with self.lock:
+            locked = time.perf_counter()
             self.grid.add_frame(self.topics.index(topic), xyz, ring, stamp, moving)
+            bin_ms = self.grid.timing()["bin_points"]
             self.grid.update(moving, self.world_from_base)
+            steps = self.grid.timing()
         done = self.now()
         sweep_end = stamp + FRAME_DURATION
         self.stats.add(delivery=received - sweep_end, grid_update=time.perf_counter() - start,
-                       sweep_end_to_grid_ready=done - sweep_end)
+                       sweep_end_to_grid_ready=done - sweep_end, update_unpack=unpacked - start,
+                       update_pose=posed - unpacked, update_wait_for_check=locked - posed,
+                       **{f"update_{k}": (bin_ms if k == "bin_points" else v) * 1e-3 for k, v in steps.items()})
         if self.publish_labels:
             labels = self.grid.labels()
             header = Header(stamp=msg.header.stamp, frame_id=GRID_FRAME)
