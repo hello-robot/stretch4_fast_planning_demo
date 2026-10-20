@@ -222,8 +222,9 @@ RayView RayTable::view(size_t voxel, const RangeImage & image, float margin) con
     }
   }
   if (hit) {return RayView::kHit;}
-  if (hidden_self) {return RayView::kHiddenBySelf;}
+  // The robot's surface runs through it (part of it can be behind that surface): the robot.
   if (hit_self) {return RayView::kHitSelf;}
+  if (hidden_self) {return RayView::kHiddenBySelf;}
   // Most of the voxel's cells went past it: whatever the rest might hide is smaller than half
   // a voxel. The LiDAR returns nothing along many depth edges, in strips a few beams wide.
   return no_info >= passed ? RayView::kNoInfo : RayView::kFree;

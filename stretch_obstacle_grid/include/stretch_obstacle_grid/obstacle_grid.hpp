@@ -5,7 +5,7 @@
 //                        no newer frame from another LiDAR sees through, and which may move
 //   kStatic              occupied, and has been where it is (in the world, not just relative
 //                        to the turning base) for at least static_after
-//   kSelf                the robot's own body
+//   kSelf                the robot's own body: inside its shapes, or holding a return off it
 //   kFree                some LiDAR's rays went past it
 //   kShadow              a blind spot the robot makes: hidden only by the robot (mostly under
 //                        the arm), or too near a LiDAR to see; probably free
@@ -183,7 +183,8 @@ private:
   void mark_static_obstacles(const Eigen::Isometry3f & world_from_base);
   void contaminate_shadows();
   bool is_self(const SelfModel & moving, const Eigen::Vector3f & p) const;
-  void drop_small_clusters(const float * xyz, const Eigen::Isometry3f & base_from_lidar, int rows, int cols);
+  void drop_small_clusters(
+    const float * xyz, const Eigen::Isometry3f & base_from_lidar, const SelfModel & self, int rows, int cols);
   // Turns veil points' cells in `image` into kPassed at the edge in front of them.
   void drop_veil_points(const float * xyz, int rows, int cols, RangeImage * image);
 
@@ -202,8 +203,9 @@ private:
   std::vector<int32_t> nearest_in_cell_;
   std::vector<uint32_t> cluster_parent_, cluster_size_;
   std::vector<uint16_t> cluster_row_min_, cluster_row_max_;
-  std::vector<uint8_t> floor_cell_;  // per cell: its return is on the floor
+  std::vector<uint8_t> unclustered_;  // per cell: its return is on the floor or the robot
   std::vector<float> veil_range_;  // per cell: the edge in front of its veil point (m), or NaN
+  std::vector<uint8_t> veil_off_robot_;  // per cell: that edge is the robot
   std::vector<uint8_t> labels_;
   VolumeTable occupied_table_, moving_table_, unsafe_table_;
   CartesianTable occupied_box_table_, moving_box_table_, unsafe_box_table_;

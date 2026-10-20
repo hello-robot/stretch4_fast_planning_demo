@@ -345,6 +345,27 @@ TEST(ObstacleGrid, ArmShadowAloneIsClean)
   EXPECT_EQ(label_at(og, 1.6f, 0.0f, 0.6f), kShadow);
 }
 
+TEST(ObstacleGrid, ReturnsOffTheRobotJustOutsideItsShapesAreTheRobot)
+{
+  // The robot's shapes fit its arm 2 cm tight: the arm's returns land 2 cm outside them (still
+  // within self_point_padding). The LiDAR sees the arm's top at a grazing angle, so each ring's
+  // returns there are a cluster of their own; being the robot's, they aren't dropped as noise.
+  Scene scene;
+  std::vector<float> xyz;
+  std::vector<uint16_t> ring;
+  scene.cast(&xyz, &ring);
+  Eigen::Isometry3f pose = Eigen::Isometry3f::Identity();
+  pose.translate(scene.arm.center());
+  const SelfModel tight({SelfShape{SelfShape::Type::kBox, pose, scene.arm.sizes() / 2.0f - Eigen::Vector3f::Constant(0.02f)}});
+  ObstacleGrid og(scene_config(), {scene.lidar()});
+  og.add_frame(0, xyz.data(), ring.data(), ring.size(), 0.0, tight);
+  og.update(tight);
+  // The arm's top face is at z = 0.95; the shapes stop at 0.93.
+  EXPECT_EQ(label_at(og, 0.4f, 0.0f, 0.945f), kSelf);
+  EXPECT_EQ(label_at(og, 0.8f, 0.0f, 0.8f), kShadow);  // behind the arm, still its shadow
+  EXPECT_EQ(label_at(og, 0.4f, 0.0f, 0.99f), kFree);   // above it, seen
+}
+
 TEST(ObstacleGrid, UnknownSpaceContaminatesShadowOnlyIfAskedTo)
 {
   Scene scene;
@@ -908,4 +929,3 @@ TEST(MotionCheck, BaseRotationSweepsTheAnglesBetween)
   EXPECT_TRUE(steps[1].blocked);
   EXPECT_GT(steps[0].travel, 0.9f * 2.0f * std::sin(0.7f));
 }
-

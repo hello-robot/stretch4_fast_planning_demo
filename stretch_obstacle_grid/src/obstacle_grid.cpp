@@ -97,7 +97,7 @@ void ObstacleGrid::add_frame(
   // as veil points.
   timing_.nearest = ms_since(start);
   auto step = Clock::now();
-  drop_small_clusters(xyz, base_from_lidar, rows, cols);
+  drop_small_clusters(xyz, base_from_lidar, self, rows, cols);
   timing_.clusters = ms_since(step);
   step = Clock::now();
 
@@ -183,6 +183,7 @@ void ObstacleGrid::drop_veil_points(const float * xyz, int rows, int cols, Range
   const float cos_angle = std::cos(params_.veil_angle);
   std::vector<float> & veil = veil_range_;
   veil.assign(nearest_in_cell_.size(), std::numeric_limits<float>::quiet_NaN());
+  veil_off_robot_.assign(nearest_in_cell_.size(), 0);
   // Each cell only writes its own flag.
   #pragma omp parallel for schedule(dynamic, 4) num_threads(params_.threads > 0 ? params_.threads : omp_get_max_threads())
   for (int row = 0; row < rows; ++row) {
@@ -210,24 +211,26 @@ void ObstacleGrid::drop_veil_points(const float * xyz, int rows, int cols, Range
           const Eigen::Vector3f to_neighbor = point(b) - p;
           if (toward_lidar.dot(to_neighbor) > cos_angle * to_neighbor.norm()) {
             veil[row * cols + col] = point(b).norm();
+            veil_off_robot_[row * cols + col] = image->hit[other] == Hit::kSelf;
             break;
           }
         }
       }
     }
   }
-  // The beam got at least as far as the edge it clipped.
+  // The beam got at least as far as the edge it clipped. If that edge is the robot's, what's
+  // behind it is the robot's blind spot (shadow), not unknown space.
   for (size_t c = 0; c < veil.size(); ++c) {
     if (!std::isnan(veil[c])) {
       nearest_in_cell_[c] = -1;
       image->range[c] = veil[c];
-      image->hit[c] = Hit::kPassed;
+      image->hit[c] = veil_off_robot_[c] ? Hit::kSelf : Hit::kPassed;
     }
   }
 }
 
 void ObstacleGrid::drop_small_clusters(
-  const float * xyz, const Eigen::Isometry3f & base_from_lidar, int rows, int cols)
+  const float * xyz, const Eigen::Isometry3f & base_from_lidar, const SelfModel & self, int rows, int cols)
 {
   if (params_.min_cluster_size <= 1 && params_.min_cluster_rings <= 1) {
     return;
@@ -238,12 +241,18 @@ void ObstacleGrid::drop_small_clusters(
   // Floor returns stay out of the clusters: they never become obstacles, far away each
   // ring's floor returns are too spread out to link (dropping them would leave holes where
   // the floor proves the space above it is clear), and noise just above the floor mustn't
-  // hide in the floor's cluster.
+  // hide in the floor's cluster. So do returns off the robot: they never become obstacles
+  // either, and on a surface seen at a grazing angle (the top of the arm, from the head) each
+  // ring's returns are too far from the next ring's to link, so they'd all be dropped.
   const float floor_z = grid_.config().z_min;
-  floor_cell_.assign(cells, 0);
+  unclustered_.assign(cells, 0);
+  #pragma omp parallel for schedule(dynamic, 512) num_threads(params_.threads > 0 ? params_.threads : omp_get_max_threads())
   for (size_t c = 0; c < cells; ++c) {
     const int32_t i = nearest_in_cell_[c];
-    floor_cell_[c] = i >= 0 && (base_from_lidar * point(i)).z() < floor_z;
+    if (i >= 0) {
+      const Eigen::Vector3f in_base = base_from_lidar * point(i);
+      unclustered_[c] = in_base.z() < floor_z || is_self(self, in_base);
+    }
   }
 
   cluster_parent_.resize(cells);
@@ -264,7 +273,7 @@ void ObstacleGrid::drop_small_clusters(
     for (int col = 0; col < cols; ++col) {
       const uint32_t cell = row * cols + col;
       const int32_t a = nearest_in_cell_[cell];
-      if (a < 0 || floor_cell_[cell]) {
+      if (a < 0 || unclustered_[cell]) {
         continue;
       }
       const float radius = params_.cluster_radius + params_.cluster_radius_per_m * point(a).norm();
@@ -275,7 +284,7 @@ void ObstacleGrid::drop_small_clusters(
         }
         const uint32_t other = (row + dr) * cols + (col + dc + cols) % cols;
         const int32_t b = nearest_in_cell_[other];
-        if (b >= 0 && !floor_cell_[other] && (point(a) - point(b)).squaredNorm() <= radius * radius) {
+        if (b >= 0 && !unclustered_[other] && (point(a) - point(b)).squaredNorm() <= radius * radius) {
           cluster_parent_[root(cell)] = root(other);
         }
       }
@@ -287,7 +296,7 @@ void ObstacleGrid::drop_small_clusters(
   cluster_row_min_.assign(cells, rows);
   cluster_row_max_.assign(cells, 0);
   for (size_t c = 0; c < cells; ++c) {
-    if (nearest_in_cell_[c] >= 0 && !floor_cell_[c]) {
+    if (nearest_in_cell_[c] >= 0 && !unclustered_[c]) {
       const uint32_t r = root(static_cast<uint32_t>(c));
       const uint16_t row = static_cast<uint16_t>(c / cols);
       ++cluster_size_[r];
@@ -296,7 +305,7 @@ void ObstacleGrid::drop_small_clusters(
     }
   }
   for (size_t c = 0; c < cells; ++c) {
-    if (nearest_in_cell_[c] < 0 || floor_cell_[c]) {
+    if (nearest_in_cell_[c] < 0 || unclustered_[c]) {
       continue;
     }
     const uint32_t r = root(static_cast<uint32_t>(c));
@@ -346,7 +355,7 @@ Label ObstacleGrid::label_voxel(size_t voxel) const
   }
   if (self_flags_[voxel]) {return kSelf;}
 
-  bool unknown = false, shadow = false;
+  bool unknown = false, shadow = false, robot = false;
   for (int lidar = 0; lidar < lidar_count(); ++lidar) {
     switch (views[lidar]) {
       case RayView::kFree:
@@ -356,6 +365,11 @@ Label ObstacleGrid::label_voxel(size_t voxel) const
         unknown = true;
         break;
       case RayView::kHitSelf:
+        // The robot's own surface, just outside its shapes (returns this close to them count
+        // as the robot): part of the robot, not a shadow. Otherwise every part the shapes
+        // fit a little tight wears a skin of shadow that links the shadows around it.
+        robot = true;
+        break;
       case RayView::kHiddenBySelf:
         shadow = true;
         break;
@@ -364,6 +378,7 @@ Label ObstacleGrid::label_voxel(size_t voxel) const
         break;
     }
   }
+  if (robot) {return kSelf;}
   // Hidden by something else from any LiDAR, or seen by none: unknown.
   return (shadow && !unknown) ? kShadow : kUnknown;
 }

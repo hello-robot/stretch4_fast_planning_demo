@@ -20,17 +20,34 @@ POINT_FIELD_TYPES = {1: "i1", 2: "u1", 3: "i2", 4: "u2", 5: "i4", 6: "u4", 7: "f
 
 # Planner shapes that never move relative to the base.
 STATIC_SHAPES = ("base", "mast", "head")
-# The base cylinder raised (m) for the grid: its dark, glossy top returns noise a few cm
-# above it.
-BASE_TOP_MARGIN = 0.05
-# The lift box grown (m, every side) for the grid: the carriage's side returns sit about
-# 4 cm outside the planner's box.
-LIFT_MARGIN = 0.03
-# Planner shapes replaced by one box around the gripper, aligned with the gripper: the
-# LiDARs' returns around it are a mess of reflections, and one box is simple to check
-# motion against.
-GRIPPER_SHAPES = ("wrist_roll", "wrist_camera", "gripper", "fingers")
-GRIPPER_BOX_MARGIN = 0.02  # m past the shapes on every side
+# The base cylinder's top raised (m) for the grid: on the robot its dark, glossy top returns
+# noise a few cm above it (5 cm was used for that); 2 cm fits the sim (Elaine, 2026-10-20).
+# Check on the robot.
+BASE_TOP_MARGIN = 0.02
+# The lift box grown (m, every side) for the grid. 3 cm covered the real carriage's side
+# returns (about 4 cm outside the planner's box) but was too big in the sim (2026-10-20,
+# Elaine); check on the robot.
+LIFT_MARGIN = 0.01
+# The arm box's top raised and the mast box's front (toward the arm, +x) moved out (m): both
+# planner boxes sit a little inside the robot (Elaine, in the sim, then against the robot's
+# returns in the first LiDAR bag, 2026-10-20).
+ARM_TOP_RAISE = 0.025
+MAST_FRONT_EXTEND = 0.01
+WRIST_TOP_RAISE = 0.03  # the box at the arm's tip (wrist_link), likewise
+# A box for the arm's first segment (arm_l0), which is thicker on the side by the robot: the
+# extending arm box as it is fully retracted, fixed to arm_l0, with its top raised this much
+# (m) over the planner's (1.5 cm over the extending box).
+ARM_BASE_TOP_RAISE = 0.04
+# Planner shapes replaced by two boxes for the grid and motion checks (the LiDARs' returns
+# around the gripper are a mess of reflections, and boxes are simple to check motion against):
+# one around the wrist roll link and its camera, aligned with the wrist roll link, and one
+# around the gripper's body and its fingers as they're open now, aligned with the gripper.
+CAMERA_SHAPES = ("wrist_roll", "wrist_camera")
+GRIPPER_SHAPES = ("gripper", "fingers")
+GRIPPER_BOX_MARGIN = 0.01  # m past the shapes on every side, both boxes
+FINGER_LINKS = ("gripper_finger_left_link", "gripper_fingertip_left_link",
+                "gripper_finger_right_link", "gripper_fingertip_right_link")
+FINGER_JOINTS = ("gripper_finger_left_joint", "gripper_finger_right_joint")
 # Returns this close to the robot's shapes are the robot (m).
 SELF_POINT_PADDING = 0.04
 
@@ -189,18 +206,64 @@ def make_grid(base_from_lidars, first_clouds, level=True, contamination_reach=No
     return grid, mounts
 
 
+class Fingers:
+    """The gripper's finger collision meshes (sg4 tool), posed in the quick-connect frame for
+    given finger joint angles, so the gripper box can fit the fingers as they're open."""
+
+    def __init__(self):
+        import io
+        import trimesh
+        import yourdfpy
+        from stretch4_kinematics.kinematic_models.utils import get_urdf
+        urdf = get_urdf(model_name="SE4", batch_name="francis", tool_name="eoa_wrist_dw4_tool_sg4")
+        self.urdf = yourdfpy.URDF.load(io.StringIO(urdf), load_meshes=False, build_scene_graph=True)
+        self.vertices = {}  # link -> hull vertices in the link's frame
+        for link in FINGER_LINKS:
+            meshes = [trimesh.load(c.geometry.mesh.filename.replace("file://", ""))
+                      for c in self.urdf.link_map[link].collisions]
+            self.vertices[link] = trimesh.util.concatenate(meshes).convex_hull.vertices
+        self._cache = {}
+
+    def points(self, left, right):
+        """Finger hull vertices in the quick_connect_interface_link frame."""
+        key = (round(float(left), 2), round(float(right), 2))
+        if key not in self._cache:
+            self.urdf.update_cfg({FINGER_JOINTS[0]: key[0], FINGER_JOINTS[1]: key[1]})
+            points = []
+            for link, vertices in self.vertices.items():
+                t = self.urdf.get_transform(frame_to=link, frame_from="quick_connect_interface_link")
+                points.append(vertices @ t[:3, :3].T + t[:3, 3])
+            self._cache[key] = np.concatenate(points)
+        return self._cache[key]
+
+
 class RobotShapes:
     """The robot's body for the grid, from the planner's collision shapes.
 
     The base, mast and head never move relative to the base
     (static_model, set once). The lift, arm and wrist follow the joint state
-    (moving_model), with the wrist roll, camera, gripper and fingers replaced by one box.
-    planning_body is the whole body that can sweep through anything, for checking motion."""
+    (moving_model), with the wrist roll and camera, and the gripper and fingers, replaced by
+    two boxes. planning_body is the whole body that can sweep through anything, for checking
+    motion. The gripper box fits the fingers as they were in the last joint state given to
+    moving_model (or set_fingers); full open until then, or without the finger meshes."""
 
     def __init__(self):
         self.config = load_config(os.path.join(get_package_share_directory("stretch_motion_planning"),
                                                "config", "stretch4_collision_primitives.yaml"))
         self.model = StretchCollisionModel(self.config)
+        try:
+            self.fingers = Fingers()
+        except Exception as e:  # another tool, or no meshes: use the planner's full-open box
+            print(f"RobotShapes: no finger meshes ({e}); the gripper box covers the fingers fully open")
+            self.fingers = None
+        self.finger_angles = None
+        self.fingers_center = np.asarray(self.config["shapes"]["fingers"]["center"], dtype=float)
+
+    def set_fingers(self, joint_state):
+        """Take the finger angles from a JointState, if it has them."""
+        positions = dict(zip(joint_state.name, joint_state.position))
+        if all(j in positions for j in FINGER_JOINTS):
+            self.finger_angles = tuple(positions[j] for j in FINGER_JOINTS)
 
     def static_model(self):
         shapes = []
@@ -212,6 +275,9 @@ class RobotShapes:
                 pose = placement.homogeneous.astype(np.float32)
                 pose[:3, 3] += pose[:3, 2] * (0.5 * BASE_TOP_MARGIN)
                 shapes.append(og.SelfShape.cylinder(pose, shape.radius, shape.halfLength + 0.5 * BASE_TOP_MARGIN))
+            elif name == "mast":
+                pose, half = grow_face(placement.homogeneous, shape.halfSide, [1.0, 0.0, 0.0], MAST_FRONT_EXTEND)
+                shapes.append(og.SelfShape.box(pose.astype(np.float32), half.astype(np.float32)))
             else:
                 shapes.append(to_self_shape(shape, placement))
         return og.SelfModel(shapes)
@@ -219,6 +285,7 @@ class RobotShapes:
     def moving_model(self, joint_state):
         """(og.SelfModel of the moving parts, planner q, the arm's center height)."""
         q = joint_vector(joint_state)
+        self.set_fingers(joint_state)
         shapes, arm_height = self._shapes(q, set(STATIC_SHAPES))
         return og.SelfModel(shapes), q, arm_height
 
@@ -231,34 +298,70 @@ class RobotShapes:
 
     def shape_names(self):
         """Names of planning_body's shapes, in order."""
-        names = [name for name, shape, _ in self.model.shape_poses(np.zeros(6))
-                 if name != "base" and name not in GRIPPER_SHAPES and type(shape).__name__ != "Halfspace"]
-        return names + ["gripper_box"]
+        names = []
+        for name, shape, _ in self.model.shape_poses(np.zeros(6)):
+            if name != "base" and name not in CAMERA_SHAPES + GRIPPER_SHAPES and type(shape).__name__ != "Halfspace":
+                names += [name, "arm_base"] if name == "arm" else [name]
+        return names + ["camera_box", "gripper_box"]
+
+    def _arm_base(self, arm_placement, extension):
+        """og.SelfShape of the arm's first segment, raised by ARM_BASE_TOP_RAISE."""
+        spec = self.config["shapes"]["arm"]
+        pose, half_x = _arm_base_box(arm_placement, extension, spec["size"][0])
+        half = np.array([half_x, 0.5 * spec["size"][1], 0.5 * spec["size"][2]])
+        pose, half = grow_face(pose, half, [0.0, 0.0, 1.0], ARM_BASE_TOP_RAISE)
+        return og.SelfShape.box(pose.astype(np.float32), half.astype(np.float32))
 
     def _shapes(self, q, skip):
         """(og.SelfShapes of every shape not in `skip` at q, the arm's center height)."""
         shapes = []
         arm_height = None
-        gripper_corners = []
-        gripper_frame = None
+        camera_corners, gripper_corners = [], []
+        frames = {}
         for name, shape, placement in self.model.shape_poses(q):
+            frames[name] = placement
             if name == "arm":
                 arm_height = float(placement.translation[2])
-            if name == "gripper":
-                gripper_frame = placement
-            if name in GRIPPER_SHAPES:
+            if name in CAMERA_SHAPES:
+                camera_corners.append(box_corners(shape, placement))
+            elif name == "fingers":
+                if self.fingers is not None and self.finger_angles is not None:
+                    # The fingers' meshes as they're open, from the quick-connect frame (the
+                    # fingers box is posed at an offset from it, with no rotation).
+                    link = placement.homogeneous.copy()
+                    link[:3, 3] -= placement.rotation @ self.fingers_center
+                    points = self.fingers.points(*self.finger_angles)
+                    gripper_corners.append(points @ link[:3, :3].T + link[:3, 3])
+                else:
+                    gripper_corners.append(box_corners(shape, placement))
+            elif name in GRIPPER_SHAPES:
                 gripper_corners.append(box_corners(shape, placement))
             elif name in skip:
                 continue
             elif name == "lift":
                 half = np.asarray(shape.halfSide, dtype=np.float32) + LIFT_MARGIN
                 shapes.append(og.SelfShape.box(placement.homogeneous.astype(np.float32), half))
+            elif name in ("arm", "wrist"):
+                raise_by = ARM_TOP_RAISE if name == "arm" else WRIST_TOP_RAISE
+                pose, half = grow_face(placement.homogeneous, shape.halfSide, [0.0, 0.0, 1.0], raise_by)
+                shapes.append(og.SelfShape.box(pose.astype(np.float32), half.astype(np.float32)))
+                if name == "arm":
+                    shapes.append(self._arm_base(placement, q[2]))
             else:
                 shape = to_self_shape(shape, placement)
                 if shape is not None:
                     shapes.append(shape)
-        shapes.append(gripper_box(np.concatenate(gripper_corners), gripper_frame))
+        shapes.append(fitted_box(np.concatenate(camera_corners), frames["wrist_roll"]))
+        shapes.append(fitted_box(np.concatenate(gripper_corners), frames["gripper"]))
         return shapes, arm_height
+
+
+def _arm_base_box(arm_placement, extension, arm_length):
+    """The arm box as it is fully retracted (arm_l0, the first segment): the extending box is
+    stretched along its +x by the extension, keeping its back face."""
+    pose = arm_placement.homogeneous.copy()
+    pose[:3, 3] -= arm_placement.rotation[:, 0] * 0.5 * extension
+    return pose, 0.5 * arm_length
 
 
 def joint_deceleration(lift):
@@ -293,10 +396,21 @@ def box_corners(shape, placement):
     return (placement.rotation @ local.T).T + placement.translation
 
 
-def gripper_box(corners, frame):
-    """One box around the gripper's shapes (their corners in base_footprint), aligned with
-    `frame` (the gripper box's pin.SE3), plus a margin. The shapes move rigidly with the
-    gripper, so the box's size never changes."""
+def grow_face(pose, half_sizes, direction, amount):
+    """(pose, half sizes) of a box (4x4 pose) with the face whose outward normal is nearest
+    `direction` (base_footprint) moved out by `amount` (m), the opposite face staying put."""
+    pose = np.array(pose, dtype=float)
+    half = np.array(half_sizes, dtype=float)
+    along = pose[:3, :3].T @ np.asarray(direction, dtype=float)
+    axis = int(np.argmax(np.abs(along)))
+    half[axis] += 0.5 * amount
+    pose[:3, 3] += pose[:3, axis] * np.sign(along[axis]) * 0.5 * amount
+    return pose, half
+
+
+def fitted_box(corners, frame):
+    """One box around points (base_footprint), aligned with `frame` (a pin.SE3), plus
+    GRIPPER_BOX_MARGIN."""
     local = (frame.rotation.T @ (corners - frame.translation).T).T
     lo, hi = local.min(axis=0), local.max(axis=0)
     pose = np.eye(4)

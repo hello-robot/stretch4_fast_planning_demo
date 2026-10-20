@@ -115,6 +115,19 @@ PYBIND11_MODULE(stretch_obstacle_grid, m)
   .def_readonly("azimuth_bins", &LidarModel::azimuth_bins);
 
   py::class_<SelfShape>(m, "SelfShape")
+  .def_property_readonly("kind", [](const SelfShape & s) {
+      switch (s.type) {
+        case SelfShape::Type::kBox: return "box";
+        case SelfShape::Type::kCylinder: return "cylinder";
+        case SelfShape::Type::kSphere: return "sphere";
+        case SelfShape::Type::kCapsule: return "capsule";
+      }
+      return "?";
+    })
+  .def_property_readonly("pose", [](const SelfShape & s) {return Eigen::Matrix4f(s.pose.matrix());},
+    "4x4 pose of the shape in base_footprint.")
+  .def_property_readonly("dims", [](const SelfShape & s) {return Eigen::Vector3f(s.dims);},
+    "Box: half sizes. Cylinder and capsule: (radius, half length, -). Sphere: (radius, -, -).")
   .def_static("box", [](const Eigen::Matrix4f & pose, const Eigen::Vector3f & half_sizes) {
       return make_shape(SelfShape::Type::kBox, pose, half_sizes);
     }, py::arg("pose"), py::arg("half_sizes"))

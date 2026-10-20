@@ -13,7 +13,8 @@ Outputs:
   obstacle_grid/timing (diagnostic_msgs/DiagnosticArray, every report_period s): how long each
       step takes, from the end of a LiDAR sweep to the grid being ready, and per check
   obstacle_grid/{occupied,static,shadow,contaminated} with publish_labels, as grid_viz_node.py
-      does (for RViz; costs a few ms per frame)
+      does, and obstacle_grid/robot_shapes (MarkerArray): the shapes the grid takes as the robot
+      (for RViz; costs a few ms per frame)
 
 Every frame from either LiDAR (each sweeps at 10 Hz, about 35 ms apart) goes into the grid as
 it arrives. The labels and tables are rebuilt after every frame, or with
@@ -64,7 +65,8 @@ from rclpy.node import Node
 from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
 from rclpy.time import Time
 from sensor_msgs.msg import JointState, PointCloud2
-from std_msgs.msg import Header
+from std_msgs.msg import ColorRGBA, Header
+from visualization_msgs.msg import Marker, MarkerArray
 
 import stretch_obstacle_grid as og
 from grid_setup import (GRID_FRAME, LIDARS, RobotShapes, cloud_fields, joint_vector, load_calibration,
@@ -82,6 +84,38 @@ ADD_FRAME_STEPS = ("bin_points", "nearest", "clusters", "classify", "veil", "emp
 
 def stamp_seconds(stamp):
     return stamp.sec + stamp.nanosec * 1e-9
+
+
+def shape_markers(header, shapes):
+    """The grid's robot shapes as translucent markers."""
+    markers = MarkerArray()
+    kinds = {"box": Marker.CUBE, "cylinder": Marker.CYLINDER, "capsule": Marker.CYLINDER, "sphere": Marker.SPHERE}
+    for i, shape in enumerate(shapes):
+        pose = np.asarray(shape.pose, dtype=float)
+        d = np.asarray(shape.dims, dtype=float)
+        m = Marker(header=header, ns="robot_shapes", id=i, type=kinds[shape.kind], action=Marker.ADD,
+                   color=ColorRGBA(r=0.2, g=0.6, b=1.0, a=0.35))
+        m.pose.position.x, m.pose.position.y, m.pose.position.z = (float(v) for v in pose[:3, 3])
+        q = rotation_to_quaternion(pose[:3, :3])
+        m.pose.orientation.x, m.pose.orientation.y, m.pose.orientation.z, m.pose.orientation.w = q
+        if shape.kind == "box":
+            m.scale.x, m.scale.y, m.scale.z = (float(v) for v in 2 * d)
+        elif shape.kind == "sphere":
+            m.scale.x = m.scale.y = m.scale.z = float(2 * d[0])
+        else:  # cylinder; a capsule as its bounding cylinder
+            m.scale.x = m.scale.y = float(2 * d[0])
+            m.scale.z = float(2 * d[1] + (2 * d[0] if shape.kind == "capsule" else 0.0))
+        markers.markers.append(m)
+    return markers
+
+
+def rotation_to_quaternion(r):
+    """(x, y, z, w) of a rotation matrix."""
+    w = np.sqrt(max(0.0, 1.0 + r[0, 0] + r[1, 1] + r[2, 2])) / 2
+    x = np.copysign(np.sqrt(max(0.0, 1.0 + r[0, 0] - r[1, 1] - r[2, 2])) / 2, r[2, 1] - r[1, 2])
+    y = np.copysign(np.sqrt(max(0.0, 1.0 - r[0, 0] + r[1, 1] - r[2, 2])) / 2, r[0, 2] - r[2, 0])
+    z = np.copysign(np.sqrt(max(0.0, 1.0 - r[0, 0] - r[1, 1] + r[2, 2])) / 2, r[1, 0] - r[0, 1])
+    return float(x), float(y), float(z), float(w)
 
 
 class Stats:
@@ -168,6 +202,8 @@ class ObstacleMonitor(Node):
         self.timing_pub = self.create_publisher(DiagnosticArray, "obstacle_grid/timing", 1)
         self.label_pubs = {name: self.create_publisher(PointCloud2, f"obstacle_grid/{name}", 1)
                            for name in DEBUG_LABELS} if self.publish_labels else {}
+        self.shapes_pub = self.create_publisher(MarkerArray, "obstacle_grid/robot_shapes", 1) if self.publish_labels else None
+        self.static_shapes = self.robot.static_model().shapes()
         self.create_timer(report_period, self.report, callback_group=sensors)
         self.get_logger().info("Waiting for a frame from each LiDAR and their mounts in TF...")
 
@@ -234,6 +270,7 @@ class ObstacleMonitor(Node):
             header = Header(stamp=msg.header.stamp, frame_id=GRID_FRAME)
             for name, publisher in self.label_pubs.items():
                 publisher.publish(xyz_cloud(header, self.centers[labels == int(PUBLISHED_LABELS[name])]))
+            self.shapes_pub.publish(shape_markers(header, self.static_shapes + moving.shapes()))
 
     def set_up(self, topic, msg):
         """Build the grid once there's a frame from every LiDAR and TF has their mounts."""
@@ -273,8 +310,10 @@ class ObstacleMonitor(Node):
             response.success, response.message = False, "a trajectory needs at least two points"
             return response
 
-        # Each point as a planner configuration, filling in joints the trajectory leaves out.
+        # Each point as a planner configuration, filling in joints the trajectory leaves out;
+        # the gripper box fits the fingers as they're open now.
         q_now = joint_vector(self.joint_state)
+        self.planned_robot.set_fingers(self.joint_state)
         index = {name: i for i, name in enumerate(request.trajectory.joint_names)}
         configurations = []
         for point in points:
