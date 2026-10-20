@@ -2,7 +2,8 @@
 """Run the obstacle grid over a recorded LiDAR bag: timing, label counts, and pictures.
 
 The bag needs /lidar_points_left and /lidar_points_right (Hesai PointCloud2 with ring and
-timestamp fields), /tf_static and /joint_states. The robot's body comes from the planner's
+timestamp fields), /tf_static, /joint_states and /wheel_odom (for telling static obstacles
+from moving ones while the base turns). The robot's body comes from the planner's
 collision shapes at each frame's joint state.
 
     ros2 run stretch_obstacle_grid replay_bag.py BAG [--start S] [--end S]
@@ -19,14 +20,15 @@ import time
 import numpy as np
 import rosbag2_py
 from rclpy.serialization import deserialize_message
+from nav_msgs.msg import Odometry
 from sensor_msgs.msg import JointState, PointCloud2
 from tf2_msgs.msg import TFMessage
 
 import stretch_obstacle_grid as og
 from grid_setup import (GRID_FRAME, LABEL_NAMES, LIDARS, RobotShapes, cloud_fields, load_calibration, make_grid,
-                        transform_matrix)
+                        odom_pose, transform_matrix)
 
-LABEL_COLORS = {og.OCCUPIED: "#b2182b", og.SELF: "#2166ac", og.SHADOW: "#7fbc41",
+LABEL_COLORS = {og.OCCUPIED: "#b2182b", og.STATIC: "#762a83", og.SELF: "#2166ac", og.SHADOW: "#7fbc41",
                 og.CONTAMINATED_SHADOW: "#f4a582", og.UNKNOWN: "#bababa"}
 
 
@@ -106,7 +108,8 @@ def save_image(path, grid, centers, cells, labels, arm_height, title):
     axes[1].set_ylabel("z (m)")
 
     # Top-down: per (radial, theta) column, the most important label at any height.
-    priority = np.array([0, 5, 1, 2, 4, 3])  # free < self < shadow < unknown < contaminated < occupied
+    # free < self < shadow < unknown < contaminated < static < occupied
+    priority = np.array([0, 6, 1, 2, 4, 3, 5])
     columns = cells[:, 0].astype(np.int64) * 1024 + cells[:, 1]
     rank = priority[labels]
     order = np.lexsort((rank, columns))
@@ -165,7 +168,8 @@ def main():
     if args.images:
         os.makedirs(args.images, exist_ok=True)
 
-    reader = open_bag(args.bag, topics + ["/joint_states"])
+    reader = open_bag(args.bag, topics + ["/joint_states", "/wheel_odom"])
+    world_from_base = np.eye(4)
     joint_state = None
     bag_start = None
     rows = []
@@ -175,6 +179,9 @@ def main():
         t_bag = (receive_ns - bag_start) * 1e-9
         if topic == "/joint_states":
             joint_state = deserialize_message(data, JointState)
+            continue
+        if topic == "/wheel_odom":
+            world_from_base = odom_pose(deserialize_message(data, Odometry))
             continue
         if joint_state is None or t_bag < args.start:
             continue
@@ -187,7 +194,7 @@ def main():
         self_model, q, arm_height = robot.moving_model(joint_state)
         grid.add_frame(topics.index(topic), xyz, ring, stamp, self_model)
         bin_ms = grid.timing()["bin_points"]
-        grid.update(self_model)
+        grid.update(self_model, world_from_base.astype(np.float32))
         timing = grid.timing()
         counts = np.bincount(grid.labels(), minlength=len(LABEL_NAMES))
         rows.append({"t": round(t_bag, 3), "lidar": topic.rsplit("_", 1)[-1], **{k: round(v, 2) for k, v in timing.items()},
@@ -203,7 +210,7 @@ def main():
     if not rows:
         print("No frames in range.")
         return
-    keys = ["bin_points", "self_voxels", "label", "contaminate", "tables"]
+    keys = ["bin_points", "self_voxels", "label", "static_obstacles", "contaminate", "tables"]
     print(f"\n{len(rows)} frames, {rows[0]['t']:.1f}-{rows[-1]['t']:.1f} s. Milliseconds per frame (median / p95 / max):")
     for k in keys:
         v = np.array([r[k] for r in rows])

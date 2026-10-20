@@ -1,8 +1,9 @@
-// Tests for the grid layout, the box-count tables, the robot's shapes, and labeling a
-// synthetic LiDAR scene.
+// Tests for the grid layout, the box-count tables, the robot's shapes, labeling a synthetic
+// LiDAR scene, and checking motion against it.
 
 #include <gtest/gtest.h>
 
+#include <array>
 #include <cmath>
 #include <limits>
 #include <memory>
@@ -10,6 +11,7 @@
 #include <ostream>
 #include <random>
 
+#include "stretch_obstacle_grid/motion_check.hpp"
 #include "stretch_obstacle_grid/obstacle_grid.hpp"
 
 using namespace stretch_obstacle_grid;
@@ -154,6 +156,48 @@ TEST(VolumeTable, CountsMatchBruteForce)
 }
 
 // --- Robot shapes ---------------------------------------------------------------------------
+
+TEST(CartesianTable, CountsEveryOverlappingVoxel)
+{
+  const CylindricalGrid grid(small_config());
+  std::mt19937 rng(7);
+  std::vector<uint8_t> values(grid.size());
+  std::bernoulli_distribution flagged(0.02);
+  for (auto & v : values) {v = flagged(rng) ? 1 : 0;}
+  CartesianTable table(grid);
+  table.build(values, 1u << 1);
+
+  std::uniform_real_distribution<float> coordinate(-0.9f, 0.9f), height(0.0f, 0.3f), size(0.0f, 0.2f);
+  for (int trial = 0; trial < 200; ++trial) {
+    const Eigen::Vector3f lo(coordinate(rng), coordinate(rng), height(rng));
+    const Eigen::AlignedBox3f box(lo, lo + Eigen::Vector3f(size(rng), size(rng), size(rng)));
+    // Flagged voxels with a corner or center inside the box must be counted; everything counted
+    // must be within a cell and a voxel of it.
+    uint32_t must = 0, may = 0;
+    const Eigen::AlignedBox3f near(box.min().array() - table.cell() - table.voxel_reach(),
+      box.max().array() + table.cell() + table.voxel_reach());
+    for (size_t i = 0; i < grid.size(); ++i) {
+      if (!values[i]) {continue;}
+      Eigen::Vector3f c;
+      grid.center(i, &c.x(), &c.y(), &c.z());
+      float r0, r1, t0, t1, z0, z1;
+      grid.bounds(grid.cell(i), &r0, &r1, &t0, &t1, &z0, &z1);
+      bool touches = box.contains(c);
+      for (float r : {r0, r1}) {
+        for (float t : {t0, t1}) {
+          for (float z : {z0, z1}) {
+            touches |= box.contains(Eigen::Vector3f(r * std::cos(t), r * std::sin(t), z));
+          }
+        }
+      }
+      must += touches;
+      may += near.contains(c);
+    }
+    const uint32_t counted = table.count(box);
+    EXPECT_GE(counted, must);
+    EXPECT_LE(counted, may);
+  }
+}
 
 TEST(SelfModel, ContainsAndRasterizes)
 {
@@ -301,18 +345,36 @@ TEST(ObstacleGrid, ArmShadowAloneIsClean)
   EXPECT_EQ(label_at(og, 1.6f, 0.0f, 0.6f), kShadow);
 }
 
-TEST(ObstacleGrid, WallBehindShadowContaminatesIt)
+TEST(ObstacleGrid, UnknownSpaceContaminatesShadowOnlyIfAskedTo)
 {
   Scene scene;
-  scene.wall_radius = 1.5f;  // inside the grid: the shadow runs into the space behind it
+  scene.wall_radius = 1.5f;  // inside the grid: the shadow runs into the unseen wall behind it
   const auto labeled = label_scene(scene);
   const ObstacleGrid & og = *labeled;
   EXPECT_EQ(label_at(og, 1.51f, 0.0f, 1.2f), kOccupied);  // the wall
   EXPECT_EQ(label_at(og, 1.49f, 0.0f, 1.2f), kUnknown);   // within range noise in front of it
   EXPECT_EQ(label_at(og, 1.8f, 0.0f, 1.2f), kUnknown);    // behind the wall
-  // The shadow next to the wall is contaminated; 0.6 m back toward the arm it isn't.
-  EXPECT_EQ(label_at(og, 1.4f, 0.0f, 0.6f), kContaminatedShadow);
-  EXPECT_EQ(label_at(og, 0.8f, 0.0f, 0.8f), kShadow);
+  // The shadow reaches the wall where the arm hides it, so that part of the wall is unknown,
+  // not an obstacle: by default the shadow next to it stays clean.
+  EXPECT_EQ(label_at(og, 1.4f, 0.0f, 0.6f), kShadow);
+
+  // With unknown space contaminating too, the shadow next to the wall is contaminated; 0.6 m
+  // back toward the arm it isn't.
+  ObstacleGridParams params;
+  params.unknown_contaminates_shadow = true;
+  const auto strict = label_scene(scene, params);
+  EXPECT_EQ(label_at(*strict, 1.4f, 0.0f, 0.6f), kContaminatedShadow);
+  EXPECT_EQ(label_at(*strict, 0.8f, 0.0f, 0.8f), kShadow);
+}
+
+TEST(ObstacleGrid, NearTheLidarIsTheRobotsBlindSpot)
+{
+  Scene scene;
+  const auto labeled = label_scene(scene);
+  // 0.2 m above the LiDAR: nothing there returns (and the rings only go to +30 deg), so no
+  // LiDAR sees it, but it's within self_blind_range.
+  EXPECT_EQ(label_at(*labeled, 0.0f, 0.1f, Scene::kHeight + 0.2f), kShadow);
+  EXPECT_EQ(label_at(*labeled, 0.0f, 0.1f, Scene::kHeight + 0.6f), kUnknown);
 }
 
 TEST(ObstacleGrid, UnlimitedReachContaminatesWholeShadow)
@@ -523,3 +585,327 @@ TEST(ObstacleGrid, ReturnBehindRobotIsAGhost)
   EXPECT_EQ(occupied, 0);
   EXPECT_EQ(label_at(og, 0.8f, 0.0f, 0.8f), kShadow);  // still the arm's shadow
 }
+
+TEST(ObstacleGrid, VeilBeamsAreFreeUpToTheEdge)
+{
+  Scene scene;
+  // A post 1 m out to the side, away from the arm. Next to its edge, the wall's returns behind
+  // it look like veil points and are dropped, but their beams still crossed the space in front
+  // of the post.
+  scene.obstacles.emplace_back(Eigen::Vector3f(-0.1f, 1.0f, 0.0f), Eigen::Vector3f(0.1f, 1.1f, 1.0f));
+  const auto labeled = label_scene(scene);
+  const ObstacleGrid & og = *labeled;
+  // Azimuth 84.1 deg is just past the edge (84.3 deg); ring 40 points 20 deg down.
+  const float azimuth = 84.1f * kPi / 180.0f, elevation = -20.0f * kPi / 180.0f;
+  const RangeImage & image = og.range_image(0);
+  const size_t cell = 40 * image.cols + static_cast<int>((azimuth + kPi) / kTwoPi * image.cols);
+  EXPECT_EQ(image.hit[cell], Hit::kPassed);
+  EXPECT_NEAR(image.range[cell], 1.0f / std::cos(elevation), 0.05f);  // the post's near face
+  const Eigen::Vector3f front(0.6f * std::cos(elevation) * std::cos(azimuth),
+    0.6f * std::cos(elevation) * std::sin(azimuth), Scene::kHeight + 0.6f * std::sin(elevation));
+  EXPECT_EQ(label_at(og, front.x(), front.y(), front.z()), kFree);
+
+  // Without the veil filter the wall's return stays.
+  ObstacleGridParams no_veil;
+  no_veil.veil_angle = 0.0f;
+  EXPECT_EQ(label_scene(scene, no_veil)->range_image(0).hit[cell], Hit::kOther);
+}
+
+// Frames of a scene with a post that stays put in the world while the base turns `yaw_rate`
+// (rad/s), one frame every 0.1 s from t = 0 to `duration`. Returns the grid after the last.
+std::unique_ptr<ObstacleGrid> watch_post(float yaw_rate, float duration, float post_appears = 0.0f)
+{
+  auto og = std::make_unique<ObstacleGrid>(scene_config(), std::vector<LidarModel>{Scene().lidar()});
+  for (float t = 0.0f; t <= duration + 1e-4f; t += 0.1f) {
+    const float yaw = yaw_rate * t;
+    Scene scene;
+    if (t >= post_appears) {
+      // At world (0, 1), so at angle 90 deg - yaw from the base.
+      const Eigen::Vector2f at = Eigen::Rotation2Df(-yaw) * Eigen::Vector2f(0.0f, 1.0f);
+      scene.obstacles.emplace_back(Eigen::Vector3f(at.x() - 0.05f, at.y() - 0.05f, 0.0f),
+        Eigen::Vector3f(at.x() + 0.05f, at.y() + 0.05f, 1.0f));
+    }
+    std::vector<float> xyz;
+    std::vector<uint16_t> ring;
+    scene.cast(&xyz, &ring);
+    const SelfModel self = scene.self();
+    og->add_frame(0, xyz.data(), ring.data(), ring.size(), t, self);
+    Eigen::Isometry3f world_from_base = Eigen::Isometry3f::Identity();
+    world_from_base.rotate(Eigen::AngleAxisf(yaw, Eigen::Vector3f::UnitZ()));
+    og->update(self, world_from_base);
+  }
+  return og;
+}
+
+// How many voxels have each label.
+std::array<int, 7> label_counts(const ObstacleGrid & og)
+{
+  std::array<int, 7> counts{};
+  for (uint8_t label : og.labels()) {++counts[label];}
+  return counts;
+}
+
+TEST(ObstacleGrid, ObstaclesThatStayPutBecomeStatic)
+{
+  // Before static_after (3 s) the post may move; after it, it's static.
+  const auto early = label_counts(*watch_post(0.0f, 2.5f));
+  EXPECT_GT(early[kOccupied], 50);
+  EXPECT_EQ(early[kStatic], 0);
+  const auto late = label_counts(*watch_post(0.0f, 3.5f));
+  EXPECT_EQ(late[kOccupied], 0);
+  EXPECT_GT(late[kStatic], 50);
+}
+
+TEST(ObstaclesThatStayPutBecomeStatic, EvenWhileTheBaseTurns)
+{
+  // 0.3 rad/s for 4 s: the post sweeps 69 deg around the grid, but stays put in the world.
+  const auto counts = label_counts(*watch_post(0.3f, 4.0f));
+  EXPECT_GT(counts[kStatic], 4 * counts[kOccupied]);
+}
+
+TEST(ObstaclesThatStayPutBecomeStatic, NewObstaclesAreNot)
+{
+  const auto counts = label_counts(*watch_post(0.0f, 4.0f, 2.0f));  // appears at 2 s
+  EXPECT_GT(counts[kOccupied], 50);
+  EXPECT_EQ(counts[kStatic], 0);
+}
+
+// --- Motion checks ---------------------------------------------------------------------------
+
+SelfShape box_shape(const Eigen::Vector3f & center, const Eigen::Vector3f & half, float yaw = 0.0f)
+{
+  Eigen::Isometry3f pose = Eigen::Isometry3f::Identity();
+  pose.rotate(Eigen::AngleAxisf(yaw, Eigen::Vector3f::UnitZ()));
+  pose.translate(center);  // after the rotation: the box turns about the axis with it
+  return SelfShape{SelfShape::Type::kBox, pose, half};
+}
+
+// True if p is inside the box, angles compared modulo a turn.
+bool inside(const CylinderBox & box, const Eigen::Vector3f & p, float tolerance = 1e-5f)
+{
+  const float r = p.head<2>().norm();
+  if (r < box.r_min - tolerance || r > box.r_max + tolerance || p.z() < box.z_min - tolerance ||
+    p.z() > box.z_max + tolerance)
+  {
+    return false;
+  }
+  if (box.theta_max - box.theta_min >= kTwoPi) {return true;}
+  float offset = std::fmod(std::atan2(p.y(), p.x()) - box.theta_min, kTwoPi);
+  if (offset < 0.0f) {offset += kTwoPi;}
+  return offset <= box.theta_max - box.theta_min + tolerance || offset >= kTwoPi - tolerance;
+}
+
+TEST(MotionCheck, CylinderBoundsOfBoxBesideAxis)
+{
+  const SelfShape box = box_shape(Eigen::Vector3f(1.0f, 0.0f, 0.5f), Eigen::Vector3f(0.1f, 0.1f, 0.1f));
+  const CylinderBox b = cylinder_bounds(piece_corners(box));
+  EXPECT_NEAR(b.theta_min, -std::atan2(0.1f, 0.9f), 1e-5f);
+  EXPECT_NEAR(b.theta_max, std::atan2(0.1f, 0.9f), 1e-5f);
+  EXPECT_NEAR(b.r_min, 0.9f, 1e-5f);  // the near face, not a corner
+  EXPECT_NEAR(b.r_max, std::hypot(1.1f, 0.1f), 1e-5f);
+  EXPECT_NEAR(b.z_min, 0.4f, 1e-5f);
+  EXPECT_NEAR(b.z_max, 0.6f, 1e-5f);
+
+  // Its far half alone.
+  const CylinderBox far = cylinder_bounds(piece_corners(box, Eigen::Vector3f(0.5f, 0.0f, 0.0f)));
+  EXPECT_NEAR(far.r_min, 1.0f, 1e-5f);
+  EXPECT_NEAR(far.theta_max, std::atan2(0.1f, 1.0f), 1e-5f);
+}
+
+TEST(MotionCheck, CylinderBoundsAroundAxisAreAFullTurn)
+{
+  const SelfShape mast = box_shape(Eigen::Vector3f(0.01f, 0.0f, 1.0f), Eigen::Vector3f(0.04f, 0.02f, 0.7f));
+  const CylinderBox b = cylinder_bounds(piece_corners(mast));
+  EXPECT_GE(b.theta_max - b.theta_min, kTwoPi);
+  EXPECT_EQ(b.r_min, 0.0f);
+}
+
+TEST(MotionCheck, CylinderBoundsAcrossPiStayNarrow)
+{
+  const SelfShape box = box_shape(Eigen::Vector3f(-1.0f, 0.0f, 0.5f), Eigen::Vector3f(0.1f, 0.1f, 0.1f));
+  const CylinderBox b = cylinder_bounds(piece_corners(box));
+  EXPECT_NEAR(b.theta_max - b.theta_min, 2.0f * std::atan2(0.1f, 0.9f), 1e-4f);
+  EXPECT_TRUE(inside(b, Eigen::Vector3f(-1.0f, 0.0f, 0.5f)));
+}
+
+TEST(MotionCheck, GrownBoxHoldsEverythingWithinDistance)
+{
+  std::mt19937 rng(3);
+  std::uniform_real_distribution<float> unit(0.0f, 1.0f);
+  for (float d : {0.02f, 0.1f, 0.3f}) {
+    for (const CylinderBox box : {CylinderBox{-0.2f, 0.3f, 0.5f, 0.7f, 0.2f, 0.4f},
+        CylinderBox{3.0f, 3.4f, 0.15f, 0.3f, 1.0f, 1.1f}})
+    {
+      const CylinderBox grown = grow(box, d);
+      for (int i = 0; i < 2000; ++i) {
+        const float theta = box.theta_min + unit(rng) * (box.theta_max - box.theta_min);
+        const float r = box.r_min + unit(rng) * (box.r_max - box.r_min);
+        const Eigen::Vector3f q(r * std::cos(theta), r * std::sin(theta),
+          box.z_min + unit(rng) * (box.z_max - box.z_min));
+        const Eigen::Vector3f offset = Eigen::Vector3f::Random().normalized() * d * unit(rng);
+        ASSERT_TRUE(inside(grown, q + offset)) << "d " << d << ", point " << (q + offset).transpose();
+      }
+    }
+  }
+}
+
+TEST(MotionCheck, MergeTakesTheShortWayAround)
+{
+  const CylinderBox a{6.2f, 6.25f, 1.0f, 1.1f, 0.0f, 0.1f};
+  const CylinderBox b{0.05f, 0.1f, 0.9f, 1.0f, 0.2f, 0.3f};
+  const CylinderBox m = merge(a, b);
+  EXPECT_NEAR(m.theta_max - m.theta_min, 0.1f + kTwoPi - 6.2f, 1e-5f);
+  EXPECT_FLOAT_EQ(m.r_min, 0.9f);
+  EXPECT_FLOAT_EQ(m.z_max, 0.3f);
+}
+
+TEST(MotionCheck, AllowedSpeedSolvesTheStoppingBudget)
+{
+  const MotionLimits limits;
+  EXPECT_FLOAT_EQ(allowed_speed(0.0f, limits.contact_speed, limits.obstacle_speed, limits.deceleration, limits), limits.contact_speed);
+  EXPECT_FLOAT_EQ(allowed_speed(-1.0f, 0.0f, limits.obstacle_speed, limits.deceleration, limits), 0.0f);
+  EXPECT_FLOAT_EQ(allowed_speed(100.0f, 0.0f, limits.obstacle_speed, limits.deceleration, limits), limits.max_speed);
+
+  const float clearance = 1.2f, vf = limits.contact_speed;
+  const float v = allowed_speed(clearance, vf, limits.obstacle_speed, limits.deceleration, limits);
+  ASSERT_GT(v, vf);
+  ASSERT_LT(v, limits.max_speed);
+  const float a = limits.deceleration, t = limits.latency, vo = limits.obstacle_speed;
+  const float needed = (vo + v) * t + vo * (v - vf) / a + (v * v - vf * vf) / (2.0f * a);
+  EXPECT_NEAR(needed, clearance, 1e-4f);
+  EXPECT_GT(allowed_speed(clearance + 0.1f, vf, limits.obstacle_speed, limits.deceleration, limits), v);
+}
+
+// The scene's arm, as a body sliding along +x by `extension`.
+SelfModel arm_at(const Scene & scene, float extension)
+{
+  return SelfModel({box_shape(scene.arm.center() + Eigen::Vector3f(extension, 0.0f, 0.0f), scene.arm.sizes() / 2.0f)});
+}
+
+TEST(MotionCheck, SlowsApproachingAnObstacleAndIsBlockedByIt)
+{
+  Scene scene;
+  // A post in front of the arm at x = 1.0..1.1, as tall as the arm is high.
+  scene.obstacles.emplace_back(Eigen::Vector3f(1.0f, -0.1f, 0.0f), Eigen::Vector3f(1.1f, 0.1f, 1.0f));
+  const auto labeled = label_scene(scene);
+
+  // The arm's front face (x = 0.5) extends to 1.05, 1 cm at a time.
+  std::vector<SelfModel> samples;
+  for (int i = 0; i <= 55; ++i) {samples.push_back(arm_at(scene, 0.01f * i));}
+  MotionLimits limits;
+  limits.max_clearance = 0.6f;
+  limits.obstacle_speed = 0.3f;  // slow enough that the speeds vary over this short motion
+  limits.unsafe_obstacle_speed = 0.3f;
+  const std::vector<StepLimit> steps = MotionCheck(limits).check(*labeled, samples);
+  ASSERT_EQ(steps.size(), 55u);
+
+  for (size_t k = 0; k < steps.size(); ++k) {
+    EXPECT_NEAR(steps[k].travel, 0.01f, 1e-5f);
+    EXPECT_EQ(steps[k].shape, 0);
+    EXPECT_NEAR(steps[k].min_duration, steps[k].travel / steps[k].speed, 1e-5f);
+    if (k > 0) {
+      // Either of two bounds may be the tighter one from step to step, so allow a little.
+      EXPECT_LE(steps[k].clearance_occupied, steps[k - 1].clearance_occupied + 0.015f);
+    }
+  }
+  // At the start the front face is 0.5 m from the post (less voxel rounding and half a step).
+  EXPECT_NEAR(steps.front().clearance_occupied, 0.5f, 0.04f);
+  EXPECT_FALSE(steps.front().blocked);
+  // The LiDAR's near field counts as the robot's own shadow, not unknown.
+  EXPECT_GT(steps.front().clearance_unsafe, 0.15f);
+  EXPECT_FALSE(steps.front().unsafe);
+  EXPECT_GT(steps.front().speed, limits.unsafe_speed);
+  // Reaching it, it's blocked, at no more than contact speed.
+  EXPECT_TRUE(steps.back().blocked);
+  EXPECT_LE(steps.back().speed, limits.contact_speed);
+}
+
+TEST(MotionCheck, ClearanceNearTheAxisDoesNotWrapAround)
+{
+  Scene scene;
+  // A post on the far side of the axis from a small moving box, both 0.5 m out (beside the
+  // arm), 0.9 m apart. Grown in cylindrical coordinates, the box would span a full turn and
+  // reach the post after about 0.23 m. The x, y, z tables round out by a cell and a voxel.
+  scene.obstacles.emplace_back(Eigen::Vector3f(-0.05f, -0.55f, 0.0f), Eigen::Vector3f(0.05f, -0.45f, 1.0f));
+  const auto labeled = label_scene(scene);
+  const Eigen::Vector3f half(0.05f, 0.05f, 0.05f);
+  MotionLimits limits;
+  limits.max_clearance = 1.2f;
+  const std::vector<StepLimit> steps = MotionCheck(limits).check(*labeled, {
+      SelfModel({box_shape(Eigen::Vector3f(0.0f, 0.50f, 0.5f), half)}),
+      SelfModel({box_shape(Eigen::Vector3f(0.0f, 0.51f, 0.5f), half)})});
+  ASSERT_EQ(steps.size(), 1u);
+  EXPECT_GT(steps[0].clearance_occupied, 0.8f);
+  EXPECT_LT(steps[0].clearance_occupied, 0.91f);
+}
+
+TEST(MotionCheck, FasterBrakingAllowsMoreSpeed)
+{
+  Scene scene;
+  scene.obstacles.emplace_back(Eigen::Vector3f(1.0f, -0.1f, 0.0f), Eigen::Vector3f(1.1f, 0.1f, 1.0f));
+  const auto labeled = label_scene(scene);
+  MotionLimits limits;
+  limits.obstacle_speed = 0.0f;  // only braking counts
+  const std::vector<SelfModel> samples = {arm_at(scene, 0.0f), arm_at(scene, 0.01f)};
+  // The arm moves 1 cm; a joint moving 1 cm with deceleration a gives braking 0.01 / a.
+  const StepLimit slow = MotionCheck(limits).check(*labeled, samples, 0.0f, 0.0f, {0.01f / 0.3f})[0];
+  const StepLimit fast = MotionCheck(limits).check(*labeled, samples, 0.0f, 0.0f, {0.01f / 3.0f})[0];
+  const StepLimit fallback = MotionCheck(limits).check(*labeled, samples)[0];
+  // Whichever of the obstacles and unsafe space (here the LiDAR's blind spots past the post)
+  // allows less.
+  auto expected = [&](const StepLimit & step, float decel) {
+      return std::min(allowed_speed(step.clearance_occupied, limits.contact_speed, 0.0f, decel, limits),
+               allowed_speed(step.clearance_unsafe, limits.unsafe_speed, 0.0f, decel, limits));
+    };
+  EXPECT_NEAR(slow.speed, expected(slow, 0.3f), 1e-5f);
+  EXPECT_NEAR(fast.speed, expected(fast, 3.0f), 1e-5f);
+  EXPECT_GT(fast.speed, slow.speed);
+  EXPECT_NEAR(fallback.speed, expected(fallback, limits.deceleration), 1e-5f);
+}
+
+TEST(MotionCheck, StandoffStopsShortOfObstacles)
+{
+  Scene scene;
+  scene.obstacles.emplace_back(Eigen::Vector3f(1.0f, -0.1f, 0.0f), Eigen::Vector3f(1.1f, 0.1f, 1.0f));
+  const auto labeled = label_scene(scene);
+  MotionLimits limits;
+  limits.standoff = 0.1f;
+  // Front face from 0.85 to 0.86: 0.14 m short of the post, inside the standoff plus the
+  // distance an obstacle covers during the latency.
+  const std::vector<StepLimit> steps = MotionCheck(limits).check(*labeled, {arm_at(scene, 0.35f), arm_at(scene, 0.36f)});
+  ASSERT_EQ(steps.size(), 1u);
+  EXPECT_FALSE(steps[0].blocked);
+  EXPECT_EQ(steps[0].speed, 0.0f);
+  EXPECT_TRUE(std::isinf(steps[0].min_duration));
+}
+
+TEST(MotionCheck, StillShapesAreNotChecked)
+{
+  Scene scene;
+  scene.obstacles.emplace_back(Eigen::Vector3f(0.5f, -0.1f, 0.0f), Eigen::Vector3f(0.6f, 0.1f, 1.0f));
+  const auto labeled = label_scene(scene);
+  // The arm touches the post but doesn't move.
+  const std::vector<StepLimit> steps = MotionCheck().check(*labeled, {arm_at(scene, 0.0f), arm_at(scene, 0.0f)});
+  ASSERT_EQ(steps.size(), 1u);
+  EXPECT_EQ(steps[0].shape, -1);
+  EXPECT_EQ(steps[0].min_duration, 0.0f);
+  EXPECT_FALSE(steps[0].blocked);
+}
+
+TEST(MotionCheck, BaseRotationSweepsTheAnglesBetween)
+{
+  Scene scene;
+  // A post at 90 degrees, 1 m out; the arm's box out at 0.7-0.9 m turns from 0 to 180 degrees.
+  scene.obstacles.emplace_back(Eigen::Vector3f(-0.05f, 0.95f, 0.0f), Eigen::Vector3f(0.05f, 1.05f, 1.0f));
+  const auto labeled = label_scene(scene);
+  const Eigen::Vector3f center(0.8f, 0.0f, 0.9f), half(0.1f, 0.05f, 0.05f);
+  // Two samples half a turn apart would be ambiguous, so take three.
+  std::vector<SelfModel> samples;
+  for (float yaw : {0.0f, 1.4f, 2.8f}) {samples.push_back(SelfModel({box_shape(center, half, yaw)}));}
+  const std::vector<StepLimit> steps = MotionCheck().check(*labeled, samples);
+  ASSERT_EQ(steps.size(), 2u);
+  EXPECT_TRUE(steps[0].blocked);  // the post sits at 90 degrees, inside the first step's sweep
+  EXPECT_TRUE(steps[1].blocked);
+  EXPECT_GT(steps[0].travel, 0.9f * 2.0f * std::sin(0.7f));
+}
+

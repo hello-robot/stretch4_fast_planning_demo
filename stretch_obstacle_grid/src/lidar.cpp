@@ -187,19 +187,26 @@ RayView RayTable::view(size_t voxel, const RangeImage & image, float margin) con
   if (e.row_lo == kInvisible || image.range.empty()) {
     return RayView::kNoInfo;
   }
-  bool no_info = false, hit = false, hit_self = false, hidden_self = false;
+  bool hit = false, hit_self = false, hidden_self = false;
+  int no_info = 0, passed = 0;  // cells that say nothing about the voxel, and that went past it
   const int col_count = e.col_hi >= e.col_lo ? e.col_hi - e.col_lo + 1 : cols_ - e.col_lo + e.col_hi + 1;
   for (int row = e.row_lo; row <= e.row_hi; ++row) {
     const size_t row_start = static_cast<size_t>(row) * cols_;
     for (int k = 0, col = e.col_lo; k < col_count; ++k, col = (col + 1 == cols_ ? 0 : col + 1)) {
       const float range = image.range[row_start + col];
       if (std::isnan(range)) {
-        no_info = true;
+        ++no_info;
         continue;
       }
       // The floor bounds the grid from below, so ending on it never hides a voxel.
       const Hit what = image.hit[row_start + col];
       if (what == Hit::kFloor) {
+        ++passed;
+        continue;
+      }
+      if (what == Hit::kPassed) {
+        // Free up to `range`; past it this beam says nothing.
+        ++(range < e.far + margin ? no_info : passed);
         continue;
       }
       if (range < e.near - margin) {
@@ -209,14 +216,17 @@ RayView RayTable::view(size_t voxel, const RangeImage & image, float margin) con
         hidden_self = true;
       } else if (range <= e.far + margin) {
         (what == Hit::kSelf ? hit_self : hit) = true;
+      } else {
+        ++passed;
       }
     }
   }
   if (hit) {return RayView::kHit;}
   if (hidden_self) {return RayView::kHiddenBySelf;}
   if (hit_self) {return RayView::kHitSelf;}
-  if (no_info) {return RayView::kNoInfo;}
-  return RayView::kFree;
+  // Most of the voxel's cells went past it: whatever the rest might hide is smaller than half
+  // a voxel. The LiDAR returns nothing along many depth edges, in strips a few beams wide.
+  return no_info >= passed ? RayView::kNoInfo : RayView::kFree;
 }
 
 }  // namespace stretch_obstacle_grid

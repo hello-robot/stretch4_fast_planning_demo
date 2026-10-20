@@ -5,6 +5,7 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 
+#include "stretch_obstacle_grid/motion_check.hpp"
 #include "stretch_obstacle_grid/obstacle_grid.hpp"
 
 namespace py = pybind11;
@@ -99,7 +100,12 @@ PYBIND11_MODULE(stretch_obstacle_grid, m)
   .def_readwrite("r_min", &CylinderBox::r_min)
   .def_readwrite("r_max", &CylinderBox::r_max)
   .def_readwrite("z_min", &CylinderBox::z_min)
-  .def_readwrite("z_max", &CylinderBox::z_max);
+  .def_readwrite("z_max", &CylinderBox::z_max)
+  .def("__repr__", [](const CylinderBox & b) {
+      return "CylinderBox(theta " + std::to_string(b.theta_min) + ".." + std::to_string(b.theta_max) +
+      ", r " + std::to_string(b.r_min) + ".." + std::to_string(b.r_max) +
+      ", z " + std::to_string(b.z_min) + ".." + std::to_string(b.z_max) + ")";
+    });
 
   py::class_<LidarModel>(m, "LidarModel")
   .def(py::init([](const Eigen::Matrix4f & base_from_lidar, std::vector<float> ring_elevation, int azimuth_bins) {
@@ -128,6 +134,8 @@ PYBIND11_MODULE(stretch_obstacle_grid, m)
   .def("contains", [](const SelfModel & s, const Eigen::Vector3f & p, float padding) {
       return s.contains(p, padding);
     }, py::arg("point"), py::arg("padding") = 0.0f)
+  .def("__len__", [](const SelfModel & s) {return s.shapes().size();})
+  .def("shapes", &SelfModel::shapes, "A copy of the shapes.")
   .def("ray_distance", &SelfModel::ray_distance, py::arg("origin"), py::arg("direction"),
     "Distance along a ray (unit direction) to the first shape it enters from outside, or inf.");
 
@@ -139,6 +147,11 @@ PYBIND11_MODULE(stretch_obstacle_grid, m)
   .def_readwrite("dropout_min_neighbors", &ObstacleGridParams::dropout_min_neighbors)
   .def_readwrite("empty_rays_hit_self", &ObstacleGridParams::empty_rays_hit_self)
   .def_readwrite("contamination_reach", &ObstacleGridParams::contamination_reach)
+  .def_readwrite("unknown_contaminates_shadow", &ObstacleGridParams::unknown_contaminates_shadow)
+  .def_readwrite("self_blind_range", &ObstacleGridParams::self_blind_range)
+  .def_readwrite("static_after", &ObstacleGridParams::static_after)
+  .def_readwrite("static_cell", &ObstacleGridParams::static_cell)
+  .def_readwrite("static_gap", &ObstacleGridParams::static_gap)
   .def_readwrite("table_threads", &ObstacleGridParams::table_threads)
   .def_readwrite("duplicate_stride", &ObstacleGridParams::duplicate_stride)
   .def_readwrite("cluster_radius", &ObstacleGridParams::cluster_radius)
@@ -155,6 +168,7 @@ PYBIND11_MODULE(stretch_obstacle_grid, m)
   .value("SHADOW", kShadow)
   .value("CONTAMINATED_SHADOW", kContaminatedShadow)
   .value("UNKNOWN", kUnknown)
+  .value("STATIC", kStatic)
   .export_values();
 
   py::enum_<RayView>(m, "RayView")
@@ -181,10 +195,11 @@ PYBIND11_MODULE(stretch_obstacle_grid, m)
     }, py::arg("lidar"), py::arg("xyz"), py::arg("ring"), py::arg("stamp"), py::arg("self_model"))
   .def("set_static_self", &ObstacleGrid::set_static_self, py::arg("self_model"),
     "The robot parts that never move relative to the base, rasterized once.")
-  .def("update", [](ObstacleGrid & g, const SelfModel & self) {
+  .def("update", [](ObstacleGrid & g, const SelfModel & self, const Eigen::Matrix4f & world_from_base) {
       py::gil_scoped_release release;
-      g.update(self);
-    }, py::arg("self_model"))
+      g.update(self, to_isometry(world_from_base));
+    }, py::arg("self_model"), py::arg("world_from_base") = Eigen::Matrix4f::Identity(),
+    "Relabel from the latest frames. world_from_base: base_footprint in odom, for static obstacles.")
   .def("labels", [](const ObstacleGrid & g) {
       const auto & labels = g.labels();
       return py::array_t<uint8_t>(static_cast<py::ssize_t>(labels.size()), labels.data());
@@ -217,6 +232,60 @@ PYBIND11_MODULE(stretch_obstacle_grid, m)
       d["label"] = t.label;
       d["contaminate"] = t.contaminate;
       d["tables"] = t.tables;
+      d["static_obstacles"] = t.static_obstacles;
       return d;
     }, "Milliseconds per step of the last add_frame and update.");
+
+  py::class_<MotionLimits>(m, "MotionLimits")
+  .def(py::init<>())
+  .def_readwrite("contact_speed", &MotionLimits::contact_speed)
+  .def_readwrite("unsafe_speed", &MotionLimits::unsafe_speed)
+  .def_readwrite("standoff", &MotionLimits::standoff)
+  .def_readwrite("obstacle_speed", &MotionLimits::obstacle_speed)
+  .def_readwrite("unsafe_obstacle_speed", &MotionLimits::unsafe_obstacle_speed)
+  .def_readwrite("latency", &MotionLimits::latency)
+  .def_readwrite("deceleration", &MotionLimits::deceleration)
+  .def_readwrite("max_speed", &MotionLimits::max_speed)
+  .def_readwrite("max_piece", &MotionLimits::max_piece)
+  .def_readwrite("max_clearance", &MotionLimits::max_clearance)
+  .def_readwrite("clearance_resolution", &MotionLimits::clearance_resolution)
+  .def_readwrite("min_motion", &MotionLimits::min_motion);
+
+  py::class_<StepLimit>(m, "StepLimit")
+  .def_readonly("min_duration", &StepLimit::min_duration)
+  .def_readonly("speed", &StepLimit::speed)
+  .def_readonly("travel", &StepLimit::travel)
+  .def_readonly("clearance_occupied", &StepLimit::clearance_occupied)
+  .def_readonly("clearance_moving", &StepLimit::clearance_moving)
+  .def_readonly("clearance_unsafe", &StepLimit::clearance_unsafe)
+  .def_readonly("blocked", &StepLimit::blocked)
+  .def_readonly("unsafe", &StepLimit::unsafe)
+  .def_readonly("shape", &StepLimit::shape);
+
+  m.def("cylinder_bounds", &cylinder_bounds, py::arg("points"),
+    "Bounds of a convex set of points (list of xyz) in cylindrical coordinates.");
+  m.def("piece_corners", &piece_corners, py::arg("shape"), py::arg("f0") = Eigen::Vector3f::Zero(),
+    py::arg("f1") = Eigen::Vector3f::Ones(),
+    "Corners of the part of a shape between fractions f0 and f1 of its size along each axis.");
+  m.def("grow", &grow, py::arg("box"), py::arg("d"));
+  m.def("merge", &merge, py::arg("a"), py::arg("b"));
+  m.def("allowed_speed", &allowed_speed, py::arg("clearance"), py::arg("final_speed"), py::arg("obstacle_speed"),
+    py::arg("deceleration"), py::arg("limits"));
+
+  py::class_<MotionCheck>(m, "MotionCheck")
+  .def(py::init<const MotionLimits &>(), py::arg("limits") = MotionLimits())
+  .def_property_readonly("limits", &MotionCheck::limits)
+  .def("check", [](const MotionCheck & c, const ObstacleGrid & grid, const std::vector<SelfModel> & samples,
+    float age, float theta_slack, const std::vector<float> & braking) {
+      py::gil_scoped_release release;
+      return c.check(grid, samples, age, theta_slack, braking);
+    }, py::arg("grid"), py::arg("samples"), py::arg("age") = 0.0f, py::arg("theta_slack") = 0.0f,
+    py::arg("braking") = std::vector<float>(),
+    "Limits for each step between consecutive posed bodies (SelfModels) along a motion.")
+  .def("clearance_occupied", [](const MotionCheck & c, const ObstacleGrid & g, const CylinderBox & box) {
+      return c.clearance(g.occupied_table(), box);
+    }, py::arg("grid"), py::arg("box"))
+  .def("clearance_unsafe", [](const MotionCheck & c, const ObstacleGrid & g, const CylinderBox & box) {
+      return c.clearance(g.unsafe_table(), box);
+    }, py::arg("grid"), py::arg("box"));
 }

@@ -25,13 +25,15 @@ struct LidarModel
   int azimuth_bins = 720;              // range image columns
 };
 
-// What the nearest return in a range image cell hit.
-enum class Hit : uint8_t {kNone = 0, kOther, kSelf, kFloor};
+// What the nearest return in a range image cell hit. kPassed: the return was dropped (a veil
+// point), but the beam got at least as far as `range` before it, so the space in front is free
+// and the space behind unknown.
+enum class Hit : uint8_t {kNone = 0, kOther, kSelf, kFloor, kPassed};
 
 struct RangeImage
 {
   int rows = 0, cols = 0;
-  std::vector<float> range;  // m; NaN where no return landed in the cell
+  std::vector<float> range;  // m; NaN where no return landed in the cell (and no kPassed)
   std::vector<Hit> hit;
 
   void reset(int rows, int cols);
@@ -47,8 +49,8 @@ struct RangeImage
 // One LiDAR's view of a voxel, combined over the rays that cross it.
 enum class RayView : uint8_t
 {
-  kNoInfo = 0,     // outside the field of view, or a crossing ray had no return
-  kFree,           // every crossing ray went past it
+  kNoInfo = 0,     // outside the field of view, or at least half the crossing rays had no return
+  kFree,           // more crossing rays went past it than had no return, and none ended in it
   kHit,            // a ray ended in it, on something other than the robot or floor
   kHitSelf,        // a ray ended in it, on the robot
   kHiddenBySelf,   // a ray ended before it, on the robot

@@ -26,13 +26,23 @@ ObstacleGrid::ObstacleGrid(
 : grid_(config), params_(params), lidars_(lidars), frames_(lidars.size()),
   static_self_flags_(grid_.size()), self_flags_(grid_.size()), occupied_by_(grid_.size()),
   labels_(grid_.size(), kUnknown),
-  occupied_table_(grid_), unsafe_table_(grid_)
+  occupied_table_(grid_), moving_table_(grid_), unsafe_table_(grid_),
+  occupied_box_table_(grid_), moving_box_table_(grid_), unsafe_box_table_(grid_),
+  near_lidar_(grid_.size(), 0)
 {
   if (lidar_count() > kMaxLidars) {
     throw std::invalid_argument("ObstacleGrid: at most 8 LiDARs");
   }
   for (const LidarModel & lidar : lidars_) {
     rays_.push_back(std::make_unique<RayTable>(grid_, lidar));
+  }
+  const float blind2 = params_.self_blind_range * params_.self_blind_range;
+  for (size_t voxel = 0; voxel < grid_.size(); ++voxel) {
+    Eigen::Vector3f c;
+    grid_.center(voxel, &c.x(), &c.y(), &c.z());
+    for (const LidarModel & lidar : lidars_) {
+      near_lidar_[voxel] |= (c - lidar.base_from_lidar.translation()).squaredNorm() < blind2;
+    }
   }
 }
 
@@ -85,8 +95,8 @@ void ObstacleGrid::add_frame(
   // Small clusters first: a stray return would otherwise mark its real neighbors behind it
   // as veil points.
   drop_small_clusters(xyz, base_from_lidar, rows, cols);
-  drop_veil_points(xyz, rows, cols);
 
+  // What each return hit.
   for (size_t cell = 0; cell < nearest_in_cell_.size(); ++cell) {
     const int32_t i = nearest_in_cell_[cell];
     if (i < 0) {
@@ -113,10 +123,17 @@ void ObstacleGrid::add_frame(
     }
     frame.image.range[cell] = range;
     frame.image.hit[cell] = what;
-
+  }
+  // Veil points next, since a ghost behind the robot isn't an edge that makes them.
+  drop_veil_points(xyz, rows, cols, &frame.image);
+  for (size_t cell = 0; cell < nearest_in_cell_.size(); ++cell) {
+    const int32_t i = nearest_in_cell_[cell];
     size_t voxel;
-    if (what == Hit::kOther && grid_.locate(in_base.x(), in_base.y(), in_base.z(), &voxel)) {
-      frame.occupied.push_back(voxel);
+    if (i >= 0 && frame.image.hit[cell] == Hit::kOther) {
+      const Eigen::Vector3f in_base = base_from_lidar * point(i);
+      if (grid_.locate(in_base.x(), in_base.y(), in_base.z(), &voxel)) {
+        frame.occupied.push_back(voxel);
+      }
     }
   }
   if (params_.empty_rays_hit_self) {
@@ -124,13 +141,15 @@ void ObstacleGrid::add_frame(
     for (int row = 0; row < rays.rows(); ++row) {
       for (int col = 0; col < rays.cols(); ++col) {
         const size_t cell = static_cast<size_t>(row) * rays.cols() + col;
-        if (!std::isnan(frame.image.range[cell])) {
+        const bool passed = frame.image.hit[cell] == Hit::kPassed;
+        if (!std::isnan(frame.image.range[cell]) && !passed) {
           continue;
         }
         const Eigen::Vector3f direction = base_from_lidar.linear() * rays.cell_direction(row, col);
         const float distance = std::min(
           static_self_.ray_distance(origin, direction), self.ray_distance(origin, direction));
-        if (std::isfinite(distance)) {
+        // A veil beam that reaches the robot by the edge it clipped ended on the robot too.
+        if (std::isfinite(distance) && (!passed || distance <= frame.image.range[cell] + params_.range_margin)) {
           frame.image.range[cell] = distance;
           frame.image.hit[cell] = Hit::kSelf;
         }
@@ -141,44 +160,52 @@ void ObstacleGrid::add_frame(
   timing_.bin_points = ms_since(start);
 }
 
-void ObstacleGrid::drop_veil_points(const float * xyz, int rows, int cols)
+void ObstacleGrid::drop_veil_points(const float * xyz, int rows, int cols, RangeImage * image)
 {
   if (params_.veil_angle <= 0.0f) {
     return;
   }
   auto point = [&](int32_t i) {return Eigen::Map<const Eigen::Vector3f>(&xyz[3 * i]);};
   const float cos_angle = std::cos(params_.veil_angle);
-  std::vector<uint8_t> & veil = veil_flags_;
-  veil.assign(nearest_in_cell_.size(), 0);
+  std::vector<float> & veil = veil_range_;
+  veil.assign(nearest_in_cell_.size(), std::numeric_limits<float>::quiet_NaN());
   for (int row = 0; row < rows; ++row) {
     for (int col = 0; col < cols; ++col) {
       const int32_t a = nearest_in_cell_[row * cols + col];
-      if (a < 0) {
-        continue;
+      const Hit what = image->hit[row * cols + col];
+      if (a < 0 || (what != Hit::kOther && what != Hit::kFloor)) {
+        continue;  // returns from the robot (and ghosts, which became robot) stay
       }
       const Eigen::Vector3f p = point(a);
       const Eigen::Vector3f toward_lidar = -p.normalized();
-      for (int dr = -1; dr <= 1 && !veil[row * cols + col]; ++dr) {
+      for (int dr = -1; dr <= 1 && std::isnan(veil[row * cols + col]); ++dr) {
         if (row + dr < 0 || row + dr >= rows) {
           continue;
         }
         for (int dc = -1; dc <= 1; ++dc) {
-          const int32_t b = nearest_in_cell_[(row + dr) * cols + (col + dc + cols) % cols];
+          const size_t other = static_cast<size_t>(row + dr) * cols + (col + dc + cols) % cols;
+          const int32_t b = nearest_in_cell_[other];
           if (b < 0 || b == a || point(b).squaredNorm() >= p.squaredNorm()) {
             continue;  // only nearer neighbors can hide this one
           }
+          if (image->hit[other] == Hit::kSelf && image->range[other] < point(b).norm() - params_.range_margin) {
+            continue;  // a ghost: nothing is really there
+          }
           const Eigen::Vector3f to_neighbor = point(b) - p;
           if (toward_lidar.dot(to_neighbor) > cos_angle * to_neighbor.norm()) {
-            veil[row * cols + col] = 1;
+            veil[row * cols + col] = point(b).norm();
             break;
           }
         }
       }
     }
   }
+  // The beam got at least as far as the edge it clipped.
   for (size_t c = 0; c < veil.size(); ++c) {
-    if (veil[c]) {
+    if (!std::isnan(veil[c])) {
       nearest_in_cell_[c] = -1;
+      image->range[c] = veil[c];
+      image->hit[c] = Hit::kPassed;
     }
   }
 }
@@ -317,6 +344,7 @@ Label ObstacleGrid::label_voxel(size_t voxel) const
         shadow = true;
         break;
       case RayView::kNoInfo:
+        shadow |= near_lidar_[voxel] != 0;  // too near a LiDAR to see: the robot's blind spot
         break;
     }
   }
@@ -326,8 +354,8 @@ Label ObstacleGrid::label_voxel(size_t voxel) const
 
 void ObstacleGrid::contaminate_shadows()
 {
-  // Breadth-first from every shadow voxel that touches unknown space or an obstacle, out to
-  // contamination_reach through the connected shadow. Distance is counted in steps of one
+  // Breadth-first from every shadow voxel that touches an obstacle (or unknown space, if
+  // unknown_contaminates_shadow), out to contamination_reach through the connected shadow. Distance is counted in steps of one
   // cell; a step around theta can be up to two cells long, so contamination may reach a bit
   // farther around the axis than the parameter says.
   const float reach = params_.contamination_reach;
@@ -343,7 +371,8 @@ void ObstacleGrid::contaminate_shadows()
     next_to.clear();
     grid_.neighbors(voxel, &next_to);
     for (size_t other : next_to) {
-      if (labels_[other] == kUnknown || labels_[other] == kOccupied) {
+      const uint8_t label = labels_[other];
+      if (label == kOccupied || label == kStatic || (label == kUnknown && params_.unknown_contaminates_shadow)) {
         labels_[voxel] = kContaminatedShadow;
         queue.emplace_back(voxel, 0);
         break;
@@ -367,7 +396,59 @@ void ObstacleGrid::contaminate_shadows()
   }
 }
 
-void ObstacleGrid::update(const SelfModel & self)
+void ObstacleGrid::mark_static_obstacles(const Eigen::Isometry3f & world_from_base)
+{
+  double now = -std::numeric_limits<double>::infinity();
+  for (const Frame & frame : frames_) {
+    now = std::max(now, frame.stamp);
+  }
+  const float cell = params_.static_cell;
+  auto key = [](const Eigen::Vector3i & c) {
+      // 21 bits per axis: +-52 km at 5 cm
+      constexpr int64_t kHalf = int64_t{1} << 20, kMask = (int64_t{1} << 21) - 1;
+      return (((c.x() + kHalf) & kMask) << 42) | (((c.y() + kHalf) & kMask) << 21) | ((c.z() + kHalf) & kMask);
+    };
+  auto cell_of = [cell](const Eigen::Vector3f & p) {return (p / cell).array().floor().cast<int>().matrix().eval();};
+
+  // Each obstacle voxel marks the world cells within half a cell of its center, so as the base
+  // turns and voxel centers slide across cells, a still obstacle's cells stay marked.
+  std::vector<std::pair<size_t, Eigen::Vector3i>> obstacles;
+  for (size_t voxel = 0; voxel < labels_.size(); ++voxel) {
+    if (labels_[voxel] != kOccupied) {
+      continue;
+    }
+    Eigen::Vector3f c;
+    grid_.center(voxel, &c.x(), &c.y(), &c.z());
+    const Eigen::Vector3f world = world_from_base * c;
+    obstacles.emplace_back(voxel, cell_of(world));
+    const Eigen::Vector3i lo = cell_of(world.array() - 0.5f * cell), hi = cell_of(world.array() + 0.5f * cell);
+    for (int x = lo.x(); x <= hi.x(); ++x) {
+      for (int y = lo.y(); y <= hi.y(); ++y) {
+        for (int z = lo.z(); z <= hi.z(); ++z) {
+          auto [it, inserted] = obstacle_cells_.try_emplace(key({x, y, z}), now, now);
+          auto & [first, last] = it->second;
+          if (!inserted && last < now) {
+            if (now - last > params_.static_gap) {
+              first = now;  // it went away for a while: it's new again
+            }
+            last = now;
+          }
+        }
+      }
+    }
+  }
+  // A voxel is static once the cell holding its center has been marked long enough.
+  for (const auto & [voxel, c] : obstacles) {
+    if (now - obstacle_cells_.at(key(c)).first >= params_.static_after) {
+      labels_[voxel] = kStatic;
+    }
+  }
+  for (auto it = obstacle_cells_.begin(); it != obstacle_cells_.end(); ) {
+    it = now - it->second.second > params_.static_gap ? obstacle_cells_.erase(it) : std::next(it);
+  }
+}
+
+void ObstacleGrid::update(const SelfModel & self, const Eigen::Isometry3f & world_from_base)
 {
   auto start = Clock::now();
   // The robot's body comes only from its shapes now: returns off the robot in an older
@@ -390,12 +471,28 @@ void ObstacleGrid::update(const SelfModel & self)
   timing_.label = ms_since(start);
 
   start = Clock::now();
+  mark_static_obstacles(world_from_base);
+  timing_.static_obstacles = ms_since(start);
+
+  start = Clock::now();
   contaminate_shadows();
   timing_.contaminate = ms_since(start);
 
   start = Clock::now();
-  occupied_table_.build(labels_, 1u << kOccupied, params_.table_threads);
-  unsafe_table_.build(labels_, (1u << kUnknown) | (1u << kContaminatedShadow), params_.table_threads);
+  const uint32_t obstacles = (1u << kOccupied) | (1u << kStatic), moving = 1u << kOccupied;
+  const uint32_t unsafe = (1u << kUnknown) | (1u << kContaminatedShadow);
+  occupied_table_.build(labels_, obstacles, params_.table_threads);
+  moving_table_.build(labels_, moving, params_.table_threads);
+  unsafe_table_.build(labels_, unsafe, params_.table_threads);
+  #pragma omp parallel sections num_threads(3)
+  {
+    #pragma omp section
+    occupied_box_table_.build(labels_, obstacles);
+    #pragma omp section
+    moving_box_table_.build(labels_, moving);
+    #pragma omp section
+    unsafe_box_table_.build(labels_, unsafe);
+  }
   timing_.tables = ms_since(start);
 }
 

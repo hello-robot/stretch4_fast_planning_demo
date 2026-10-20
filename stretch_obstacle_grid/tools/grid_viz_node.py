@@ -5,7 +5,7 @@ each label's voxels as its own PointCloud2 (base_footprint), for checking by eye
     ros2 run stretch_obstacle_grid grid_viz_node.py [--ros-args -p show_unknown:=true]
     rviz2 -d $(ros2 pkg prefix stretch_obstacle_grid)/share/stretch_obstacle_grid/rviz/stretch4_obstacle_grid.rviz
 
-Topics: /obstacle_grid/{occupied,self,shadow,contaminated,unknown}. Unknown space is most of
+Topics: /obstacle_grid/{occupied,static,self,shadow,contaminated,unknown}. Unknown space is most of
 the grid, so it's off unless show_unknown is set. /obstacle_grid/points_{left,right} are the
 LiDAR clouds as the grid sees them: in base_footprint with the leveled mounts, so they line
 up with the voxels (the raw clouds use TF's un-leveled mounts, a few cm off).
@@ -16,6 +16,8 @@ Parameters:
   setup_frames (10): clouds per LiDAR to collect before starting.
   contamination_reach (0.2): m into a shadow from where it touches unknown space or an obstacle.
   show_unknown (false): also publish unknown voxels.
+  world_frame ("odom"): a frame fixed in the world, from TF, for telling static obstacles from
+      moving ones while the base turns. If TF doesn't have it, the base counts as not moving.
   calibration_file (""): a stretch_calibration_values.yaml with LiDAR joint origins (e.g. from
       calibrate_lidars.py) to use instead of TF's mounts, before it's installed on the robot.
       Set level_to_floor:=false with it, since the calibration already includes the floor.
@@ -36,7 +38,7 @@ from std_msgs.msg import Header
 import stretch_obstacle_grid as og
 from grid_setup import GRID_FRAME, LIDARS, RobotShapes, cloud_fields, load_calibration, make_grid, transform_matrix
 
-PUBLISHED_LABELS = {"occupied": og.OCCUPIED, "self": og.SELF, "shadow": og.SHADOW,
+PUBLISHED_LABELS = {"occupied": og.OCCUPIED, "static": og.STATIC, "self": og.SELF, "shadow": og.SHADOW,
                     "contaminated": og.CONTAMINATED_SHADOW, "unknown": og.UNKNOWN}
 XYZ_FIELDS = [PointField(name=n, offset=4 * i, datatype=PointField.FLOAT32, count=1) for i, n in enumerate("xyz")]
 
@@ -56,6 +58,7 @@ class GridVizNode(Node):
         self.reach = self.declare_parameter("contamination_reach", 0.2).value
         self.show_unknown = self.declare_parameter("show_unknown", False).value
         self.publish_points = self.declare_parameter("publish_points", True).value
+        self.world_frame = self.declare_parameter("world_frame", "odom").value
         calibration_file = self.declare_parameter("calibration_file", "").value
         self.calibration = load_calibration(calibration_file) if calibration_file else {}
 
@@ -96,7 +99,7 @@ class GridVizNode(Node):
         self.grid.add_frame(self.topics.index(topic), xyz, ring,
                             msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9, moving)
         bin_ms = self.grid.timing()["bin_points"]
-        self.grid.update(moving)
+        self.grid.update(moving, self.world_from_base(msg.header.stamp))
         self.publish(msg.header.stamp)
         if self.publish_points:
             mount = self.mounts[self.topics.index(topic)]
@@ -109,6 +112,17 @@ class GridVizNode(Node):
         if self.frames % 50 == 0:
             t = np.array(self.timings[-50:])
             self.get_logger().info(f"{self.frames} frames; grid update {np.median(t):.1f} ms median, {t.max():.1f} max")
+
+    def world_from_base(self, stamp):
+        """base_footprint in world_frame at `stamp` (or the latest), as float32 4x4."""
+        try:
+            t = self.tf_buffer.lookup_transform(self.world_frame, GRID_FRAME, Time.from_msg(stamp))
+        except tf2_ros.TransformException:
+            try:
+                t = self.tf_buffer.lookup_transform(self.world_frame, GRID_FRAME, Time())
+            except tf2_ros.TransformException:
+                return np.eye(4, dtype=np.float32)
+        return transform_matrix(t.transform).astype(np.float32)
 
     def collect(self, topic, msg):
         """Gather the first clouds, then build the grid once TF has the LiDAR mounts."""

@@ -2,25 +2,30 @@
 //
 // Labels come from the latest frame of every LiDAR:
 //   kOccupied            a return from something that isn't the robot or the floor, which
-//                        no newer frame from another LiDAR sees through
+//                        no newer frame from another LiDAR sees through, and which may move
+//   kStatic              occupied, and has been where it is (in the world, not just relative
+//                        to the turning base) for at least static_after
 //   kSelf                the robot's own body
 //   kFree                some LiDAR's rays went past it
-//   kShadow              hidden only by the robot (mostly under the arm); probably free
-//   kContaminatedShadow  shadow within contamination_reach of unknown space or an obstacle,
-//                        which a person could be reaching in from, so it counts as possibly
-//                        occupied
+//   kShadow              a blind spot the robot makes: hidden only by the robot (mostly under
+//                        the arm), or too near a LiDAR to see; probably free
+//   kContaminatedShadow  shadow within contamination_reach of an obstacle (and of unknown
+//                        space, if unknown_contaminates_shadow), which a person could be
+//                        reaching in from, so it counts as possibly occupied
 //   kUnknown             hidden by something else, or not seen at all
-// "Unsafe" means unknown or contaminated shadow: the robot moves through it only at contact
-// speed.
+// "Obstacles" means occupied or static. "Unsafe" means unknown or contaminated shadow: the
+// robot moves through it only at contact speed.
 
 #pragma once
 
 #include <array>
 #include <cstdint>
 #include <memory>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
+#include "stretch_obstacle_grid/cartesian_table.hpp"
 #include "stretch_obstacle_grid/cylindrical_grid.hpp"
 #include "stretch_obstacle_grid/lidar.hpp"
 #include "stretch_obstacle_grid/self_model.hpp"
@@ -37,6 +42,7 @@ enum Label : uint8_t
   kShadow = 3,
   kContaminatedShadow = 4,
   kUnknown = 5,
+  kStatic = 6,
 };
 
 struct ObstacleGridParams
@@ -47,12 +53,27 @@ struct ObstacleGridParams
   int dropout_min_neighbors = 4;     // see RangeImage::fill_dropouts; 9 turns filling off
   // The robot's dark, glossy covers often return nothing. An empty ray whose path hits the
   // robot's shapes counts as hitting the robot there, so it hides what's behind as shadow
-  // rather than leaving it unknown.
+  // rather than leaving it unknown. So does a veil point's beam that reaches the robot.
   bool empty_rays_hit_self = true;
   // How far (m) contamination reaches into a shadow from where the shadow touches unknown
   // space or an obstacle: a hidden person has to connect to something visible within about
   // a body part's length. Infinity contaminates the whole connected shadow.
   float contamination_reach = 0.20f;
+  // Whether shadow touching unknown space is contaminated too (from there, not just from
+  // obstacles). Off: a person can't hide entirely in the robot's blind spots, and if they're
+  // partly in view, the obstacle they make contaminates it.
+  bool unknown_contaminates_shadow = false;
+  // Voxels this close (m) to a LiDAR that no LiDAR sees count as the robot's shadow: nothing
+  // returns from within min_return_range, so the head's surroundings are always blind.
+  float self_blind_range = 0.40f;
+  // Obstacles that have stayed put this long (s) are static: the robot can assume they won't
+  // come at it. Tracked in cells of static_cell (m) in the world frame passed to update(), so
+  // turning the base doesn't make them new; a cell may go unseen for up to static_gap (s).
+  // Each obstacle voxel marks the cells within half a cell of its center, so anything within
+  // about a cell of a static obstacle's surface may count as static too.
+  float static_after = 3.0f;
+  float static_cell = 0.05f;
+  float static_gap = 0.5f;
   int table_threads = 8;  // OpenMP threads for building the box-count tables
   // In dual-return mode the Hesai repeats each firing's points, identical 99.9% of the time.
   // A point bitwise identical to the one this many points earlier is skipped; set it to the
@@ -74,7 +95,9 @@ struct ObstacleGridParams
   // and what's behind it, drawing a dim streak of fake points behind every edge. A return is
   // dropped when a nearer neighboring return lies within veil_angle of straight along its
   // beam, i.e. the two are stacked in depth rather than side by side on a surface. Real edges
-  // (the nearer returns) are kept. 0 turns this off.
+  // (the nearer returns) are kept, and ghosts behind the robot don't count as edges. The
+  // dropped return's beam still got as far as the edge, so the space in front of the edge stays
+  // free and only the space behind it is unknown. 0 turns this off.
   float veil_angle = 0.1745f;  // rad (10 deg)
   // Returns nearer than this (m) count as no return: the Hesai's near field is unreliable,
   // and only the robot's own head and mast are this close to the LiDARs.
@@ -89,6 +112,7 @@ struct Timing
   double label = 0.0;
   double contaminate = 0.0;
   double tables = 0.0;
+  double static_obstacles = 0.0;
 };
 
 class ObstacleGrid
@@ -117,12 +141,21 @@ public:
     int lidar, const float * xyz, const uint16_t * ring, size_t n, double stamp, const SelfModel & self);
 
   // Relabel every voxel from the latest frames, with the robot's body as it is now, and
-  // rebuild the tables.
-  void update(const SelfModel & self);
+  // rebuild the tables. world_from_base: base_footprint in a frame fixed in the world (odom),
+  // for telling static obstacles from moving ones.
+  void update(const SelfModel & self, const Eigen::Isometry3f & world_from_base = Eigen::Isometry3f::Identity());
 
   const std::vector<uint8_t> & labels() const {return labels_;}
+  // Box counts of obstacles (occupied or static), of the ones that may move (occupied), and
+  // of unsafe space, for boxes in (theta, r, z) and in x, y, z.
   uint32_t count_occupied(const CylinderBox & box) const {return occupied_table_.count(box);}
   uint32_t count_unsafe(const CylinderBox & box) const {return unsafe_table_.count(box);}
+  const VolumeTable & occupied_table() const {return occupied_table_;}
+  const VolumeTable & moving_table() const {return moving_table_;}
+  const VolumeTable & unsafe_table() const {return unsafe_table_;}
+  const CartesianTable & occupied_box_table() const {return occupied_box_table_;}
+  const CartesianTable & moving_box_table() const {return moving_box_table_;}
+  const CartesianTable & unsafe_box_table() const {return unsafe_box_table_;}
 
   // Start time of the oldest frame behind the current labels: obstacles may have moved
   // since then, which the caller pads for.
@@ -141,10 +174,12 @@ private:
   };
 
   Label label_voxel(size_t voxel) const;
+  void mark_static_obstacles(const Eigen::Isometry3f & world_from_base);
   void contaminate_shadows();
   bool is_self(const SelfModel & moving, const Eigen::Vector3f & p) const;
   void drop_small_clusters(const float * xyz, const Eigen::Isometry3f & base_from_lidar, int rows, int cols);
-  void drop_veil_points(const float * xyz, int rows, int cols);
+  // Turns veil points' cells in `image` into kPassed at the edge in front of them.
+  void drop_veil_points(const float * xyz, int rows, int cols, RangeImage * image);
 
   CylindricalGrid grid_;
   ObstacleGridParams params_;
@@ -162,9 +197,13 @@ private:
   std::vector<uint32_t> cluster_parent_, cluster_size_;
   std::vector<uint16_t> cluster_row_min_, cluster_row_max_;
   std::vector<uint8_t> floor_cell_;  // per cell: its return is on the floor
-  std::vector<uint8_t> veil_flags_;  // per cell: its return is a veil point
+  std::vector<float> veil_range_;  // per cell: the edge in front of its veil point (m), or NaN
   std::vector<uint8_t> labels_;
-  VolumeTable occupied_table_, unsafe_table_;
+  VolumeTable occupied_table_, moving_table_, unsafe_table_;
+  CartesianTable occupied_box_table_, moving_box_table_, unsafe_box_table_;
+  std::vector<uint8_t> near_lidar_;  // per voxel: within self_blind_range of a LiDAR
+  // World cells where obstacles have been: (first, last) time seen, with no gap over static_gap.
+  std::unordered_map<int64_t, std::pair<double, double>> obstacle_cells_;
   Timing timing_;
 };
 

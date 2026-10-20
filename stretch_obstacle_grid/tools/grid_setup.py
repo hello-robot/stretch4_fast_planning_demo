@@ -13,7 +13,7 @@ from stretch_motion_planning.collision_model import StretchCollisionModel, load_
 # LiDAR cloud topic -> its frame.
 LIDARS = {"/lidar_points_left": "lidar_left_link", "/lidar_points_right": "lidar_right_link"}
 GRID_FRAME = "base_footprint"
-LABEL_NAMES = ["free", "occupied", "self", "shadow", "contaminated", "unknown"]
+LABEL_NAMES = ["free", "occupied", "self", "shadow", "contaminated", "unknown", "static"]
 
 ARM_SEGMENTS = ["arm_l1_joint", "arm_l2_joint", "arm_l3_joint", "arm_l4_joint"]
 POINT_FIELD_TYPES = {1: "i1", 2: "u1", 3: "i2", 4: "u2", 5: "i4", 6: "u4", 7: "f4", 8: "f8"}
@@ -34,6 +34,16 @@ GRIPPER_BOX_MARGIN = 0.02  # m past the shapes on every side
 # Returns this close to the robot's shapes are the robot (m).
 SELF_POINT_PADDING = 0.04
 
+# How hard each joint can brake (m/s^2 or rad/s^2), in planner joint order (base rotation, lift,
+# arm, wrist yaw, pitch, roll), measured with braking_test.py on 2026-10-20: lift 1.15-1.38 at
+# 1.0 commanded, arm 0.68 at 0.7, base 5.1-5.4 rad/s^2 at 4.0. The wrists slowing to a crawl
+# braked at 7.8-11.5 rad/s^2 or more (a rough fit to 50 Hz positions) with 7 or 12 commanded;
+# 7 is the lower bound. (A wrist commanded exactly 0 quick-stops within ~20 ms.)
+JOINT_DECELERATION = np.array([4.0, 1.0, 0.7, 7.0, 7.0, 7.0])
+# stretch4_body's sentry lowers the base's rotational acceleration as the lift rises, from 4.0
+# at 0.2 m or lower to 1.0 at the top of the lift (m).
+BASE_DECEL_FULL_BELOW, LIFT_TOP, BASE_DECEL_AT_TOP = 0.2, 1.2, 1.0
+
 
 # --- Clouds ----------------------------------------------------------------------------------
 
@@ -46,6 +56,20 @@ def cloud_fields(msg):
     points = np.frombuffer(bytes(msg.data), dtype=dtype, count=msg.width * msg.height)
     xyz = np.stack([points["x"], points["y"], points["z"]], axis=1).astype(np.float32)
     return xyz, points["ring"].astype(np.uint16)
+
+
+def planar_pose(x, y, yaw):
+    """4x4 of a pose in the floor plane, e.g. base_footprint in odom."""
+    m = np.eye(4)
+    m[:2, :2] = [[np.cos(yaw), -np.sin(yaw)], [np.sin(yaw), np.cos(yaw)]]
+    m[:2, 3] = (x, y)
+    return m
+
+
+def odom_pose(msg):
+    """4x4 base pose from a nav_msgs Odometry."""
+    p, q = msg.pose.pose.position, msg.pose.pose.orientation
+    return planar_pose(p.x, p.y, np.arctan2(2 * (q.w * q.z + q.x * q.y), 1 - 2 * (q.y * q.y + q.z * q.z)))
 
 
 def transform_matrix(t):
@@ -123,12 +147,13 @@ def load_calibration(path):
 
 # --- The grid --------------------------------------------------------------------------------
 
-def make_grid(base_from_lidars, first_clouds, level=True, contamination_reach=None, log=print):
+def make_grid(base_from_lidars, first_clouds, level=True, contamination_reach=None, log=print, overrides=None):
     """(an ObstacleGrid for the LiDARs with the robot's static body set, the LiDAR mounts it
     uses after leveling).
 
     base_from_lidars: one 4x4 per LiDAR (from TF). first_clouds: per LiDAR, a few
-    [(xyz, ring), ...] from the start, for ring elevations and leveling."""
+    [(xyz, ring), ...] from the start, for ring elevations and leveling. overrides: {name:
+    value} for other ObstacleGridParams, for experiments."""
     models, mounts = [], []
     for i, (base_from_lidar, clouds) in enumerate(zip(base_from_lidars, first_clouds)):
         if level:
@@ -143,6 +168,8 @@ def make_grid(base_from_lidars, first_clouds, level=True, contamination_reach=No
     params.duplicate_stride = len(models[0].ring_elevation)  # the Hesais run in dual-return mode
     if contamination_reach is not None:
         params.contamination_reach = contamination_reach
+    for name, value in (overrides or {}).items():
+        setattr(params, name, value)
     grid = og.ObstacleGrid(og.GridConfig(), models, params)
     grid.set_static_self(RobotShapes().static_model())
     return grid, mounts
@@ -153,7 +180,8 @@ class RobotShapes:
 
     The base, mast and head never move relative to the base
     (static_model, set once). The lift, arm and wrist follow the joint state
-    (moving_model), with the wrist roll, camera, gripper and fingers replaced by one box."""
+    (moving_model), with the wrist roll, camera, gripper and fingers replaced by one box.
+    planning_body is the whole body that can sweep through anything, for checking motion."""
 
     def __init__(self):
         config = load_config(os.path.join(get_package_share_directory("stretch_motion_planning"),
@@ -176,9 +204,25 @@ class RobotShapes:
 
     def moving_model(self, joint_state):
         """(og.SelfModel of the moving parts, planner q, the arm's center height)."""
-        positions = dict(zip(joint_state.name, joint_state.position))
-        q = np.array([0.0, positions["lift_joint"], sum(positions[s] for s in ARM_SEGMENTS),
-                      positions["wrist_yaw_joint"], positions["wrist_pitch_joint"], positions["wrist_roll_joint"]])
+        q = joint_vector(joint_state)
+        shapes, arm_height = self._shapes(q, set(STATIC_SHAPES))
+        return og.SelfModel(shapes), q, arm_height
+
+    def planning_body(self, q):
+        """og.SelfModel of everything but the base at planner configuration q (base rotation
+        first, relative to base_footprint now), in a fixed order, for MotionCheck. The base
+        is round and turns in place, so it never sweeps anything new."""
+        shapes, _ = self._shapes(q, {"base"})
+        return og.SelfModel(shapes)
+
+    def shape_names(self):
+        """Names of planning_body's shapes, in order."""
+        names = [name for name, shape, _ in self.model.shape_poses(np.zeros(6))
+                 if name != "base" and name not in GRIPPER_SHAPES and type(shape).__name__ != "Halfspace"]
+        return names + ["gripper_box"]
+
+    def _shapes(self, q, skip):
+        """(og.SelfShapes of every shape not in `skip` at q, the arm's center height)."""
         shapes = []
         arm_height = None
         gripper_corners = []
@@ -190,15 +234,42 @@ class RobotShapes:
                 gripper_frame = placement
             if name in GRIPPER_SHAPES:
                 gripper_corners.append(box_corners(shape, placement))
+            elif name in skip:
+                continue
             elif name == "lift":
                 half = np.asarray(shape.halfSide, dtype=np.float32) + LIFT_MARGIN
                 shapes.append(og.SelfShape.box(placement.homogeneous.astype(np.float32), half))
-            elif name not in STATIC_SHAPES:
+            else:
                 shape = to_self_shape(shape, placement)
                 if shape is not None:
                     shapes.append(shape)
         shapes.append(gripper_box(np.concatenate(gripper_corners), gripper_frame))
-        return og.SelfModel(shapes), q, arm_height
+        return shapes, arm_height
+
+
+def joint_deceleration(lift):
+    """JOINT_DECELERATION with the base's limit for this lift height (m)."""
+    k = np.clip(1.0 - (lift - BASE_DECEL_FULL_BELOW) / (LIFT_TOP - BASE_DECEL_FULL_BELOW), 0.0, 1.0)
+    decel = JOINT_DECELERATION.copy()
+    decel[0] = BASE_DECEL_AT_TOP + (JOINT_DECELERATION[0] - BASE_DECEL_AT_TOP) * k
+    return decel
+
+
+def step_braking(qs):
+    """MotionCheck's per-step braking for planner configurations qs (n, 6): for each step, the
+    largest |joint change| / joint deceleration (s^2), the base's at the higher lift of the two."""
+    qs = np.asarray(qs, dtype=float)
+    braking = []
+    for a, b in zip(qs[:-1], qs[1:]):
+        braking.append(float(np.max(np.abs(b - a) / joint_deceleration(max(a[1], b[1])))))
+    return braking
+
+
+def joint_vector(joint_state, base_rotation=0.0):
+    """Planner q (base rotation, lift, arm, wrist yaw, pitch, roll) from a JointState."""
+    positions = dict(zip(joint_state.name, joint_state.position))
+    return np.array([base_rotation, positions["lift_joint"], sum(positions[s] for s in ARM_SEGMENTS),
+                     positions["wrist_yaw_joint"], positions["wrist_pitch_joint"], positions["wrist_roll_joint"]])
 
 
 def box_corners(shape, placement):

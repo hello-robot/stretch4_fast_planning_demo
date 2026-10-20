@@ -28,6 +28,8 @@ add_library(${PROJECT_NAME}_core STATIC
   src/self_model.cpp
   src/lidar.cpp
   src/obstacle_grid.cpp
+  src/motion_check.cpp
+  src/cartesian_table.cpp
 )
 target_include_directories(${PROJECT_NAME}_core PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
