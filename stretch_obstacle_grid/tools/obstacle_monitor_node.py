@@ -1,0 +1,329 @@
+#!/usr/bin/env python3
+"""The obstacle monitor: keeps the obstacle grid up to date from the LiDARs and answers
+CheckMotion requests from the trajectory server.
+
+    ros2 run stretch_obstacle_grid obstacle_monitor_node.py [--ros-args -p publish_labels:=true]
+
+Inputs: /lidar_points_left and /lidar_points_right (Hesai PointCloud2), /joint_states,
+/wheel_odom (for telling static obstacles from moving ones while the base turns), and TF for
+the LiDAR mounts.
+
+Outputs:
+  check_motion (stretch_motion_planning_interfaces/CheckMotion)
+  obstacle_grid/timing (diagnostic_msgs/DiagnosticArray, every report_period s): how long each
+      step takes, from the end of a LiDAR sweep to the grid being ready, and per check
+  obstacle_grid/{occupied,static,shadow,contaminated} with publish_labels, as grid_viz_node.py
+      does (for RViz; costs a few ms per frame)
+
+The grid updates on every frame from either LiDAR (each sweeps at 10 Hz, about 35 ms apart).
+Frames that arrive while the grid is busy are dropped, keeping only the newest, and counted.
+
+Parameters:
+  latency (0.15): s from a check's answer to the robot starting to slow (the braking test
+      measured under 0.14 s from the desktop, network included). The age of the LiDAR data
+      is measured per check and added on top.
+  obstacle_speed (1.5): m/s a moving obstacle is assumed to approach at.
+  stale_after (0.5): s; a check fails if the oldest frame behind the grid is older than this
+      (a LiDAR stopped), so the server treats everything as unknown.
+  contamination_reach (0.2), static_after (3.0): see ObstacleGridParams.
+  publish_labels (false), report_period (5.0)
+  calibration_file (""): a stretch_calibration_values.yaml with LiDAR joint origins to use
+      instead of TF's mounts, for bags recorded before the robot was calibrated.
+"""
+
+import collections
+import threading
+import time
+
+import numpy as np
+import rclpy
+import tf2_ros
+from diagnostic_msgs.msg import DiagnosticArray, DiagnosticStatus, KeyValue
+from nav_msgs.msg import Odometry
+from rclpy.callback_groups import MutuallyExclusiveCallbackGroup, ReentrantCallbackGroup
+from rclpy.executors import MultiThreadedExecutor
+from rclpy.node import Node
+from rclpy.qos import qos_profile_sensor_data
+from rclpy.time import Time
+from sensor_msgs.msg import JointState, PointCloud2
+from std_msgs.msg import Header
+
+import stretch_obstacle_grid as og
+from grid_setup import (GRID_FRAME, LIDARS, RobotShapes, cloud_fields, joint_vector, load_calibration, make_grid,
+                        odom_pose, step_braking, transform_matrix)
+from grid_viz_node import PUBLISHED_LABELS, xyz_cloud
+from stretch_motion_planning.collision_model import JOINT_NAMES
+from stretch_motion_planning_interfaces.srv import CheckMotion
+
+FRAME_DURATION = 0.1  # s per LiDAR sweep
+DEBUG_LABELS = ("occupied", "static", "shadow", "contaminated")
+
+
+def stamp_seconds(stamp):
+    return stamp.sec + stamp.nanosec * 1e-9
+
+
+class Stats:
+    """Recent samples of named timings, summarized for the timing report."""
+
+    def __init__(self):
+        self.samples = collections.defaultdict(lambda: collections.deque(maxlen=500))
+        self.counts = collections.Counter()
+        self.lock = threading.Lock()  # added to from the cloud and service threads
+
+    def add(self, **values):
+        with self.lock:
+            for name, value in values.items():
+                self.samples[name].append(value)
+
+    def count(self, name, n=1):
+        with self.lock:
+            self.counts[name] += n
+
+    def summary(self):
+        with self.lock:
+            samples = {name: np.array(values) for name, values in self.samples.items()}
+            counts = dict(self.counts)
+        out = {}
+        for name, values in samples.items():
+            v = values * 1e3
+            out[name] = f"median {np.median(v):.1f} ms, p95 {np.percentile(v, 95):.1f}, max {v.max():.1f} (n={len(v)})"
+        out.update({name: str(count) for name, count in counts.items()})
+        return out
+
+
+class ObstacleMonitor(Node):
+    def __init__(self):
+        super().__init__("obstacle_monitor")
+        self.reach = self.declare_parameter("contamination_reach", 0.2).value
+        self.static_after = self.declare_parameter("static_after", 3.0).value
+        self.stale_after = self.declare_parameter("stale_after", 0.5).value
+        self.publish_labels = self.declare_parameter("publish_labels", False).value
+        report_period = self.declare_parameter("report_period", 5.0).value
+        calibration_file = self.declare_parameter("calibration_file", "").value
+        self.calibration = load_calibration(calibration_file) if calibration_file else {}
+        limits = og.MotionLimits()
+        limits.latency = self.declare_parameter("latency", 0.15).value
+        limits.obstacle_speed = self.declare_parameter("obstacle_speed", 1.5).value
+        self.checker = og.MotionCheck(limits)
+
+        # Posing the shapes changes the model in place (the arm box stretches), so the cloud
+        # thread and the check_motion thread each have their own.
+        self.robot = RobotShapes()
+        self.planned_robot = RobotShapes()
+        resolution = self.robot.config["planner"]["check_resolution"]
+        self.resolution = np.array([resolution[name] for name in JOINT_NAMES])
+        self.names = self.robot.shape_names()
+
+        self.tf_buffer = tf2_ros.Buffer()
+        self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
+        self.topics = list(LIDARS)
+        self.first_clouds = {}
+        self.grid = None
+        self.centers = None
+        self.lock = threading.Lock()  # the grid: updates and checks take turns
+        self.joint_state = None
+        self.world_from_base = np.eye(4, dtype=np.float32)
+        self.headings = collections.deque(maxlen=200)  # (stamp, yaw) from odometry, for theta slack
+        self.last_stamp = {}
+        self.stats = Stats()
+
+        sensors = ReentrantCallbackGroup()
+        self.create_subscription(JointState, "joint_states", self.on_joint_state, 10, callback_group=sensors)
+        self.create_subscription(Odometry, "wheel_odom", self.on_odom, 10, callback_group=sensors)
+        clouds = MutuallyExclusiveCallbackGroup()
+        for topic in self.topics:
+            self.create_subscription(PointCloud2, topic, lambda msg, t=topic: self.on_cloud(t, msg),
+                                     qos_profile_sensor_data, callback_group=clouds)
+        self.create_service(CheckMotion, "check_motion", self.check_motion,
+                            callback_group=MutuallyExclusiveCallbackGroup())
+        self.timing_pub = self.create_publisher(DiagnosticArray, "obstacle_grid/timing", 1)
+        self.label_pubs = {name: self.create_publisher(PointCloud2, f"obstacle_grid/{name}", 1)
+                           for name in DEBUG_LABELS} if self.publish_labels else {}
+        self.create_timer(report_period, self.report, callback_group=sensors)
+        self.get_logger().info("Waiting for a frame from each LiDAR and their mounts in TF...")
+
+    def now(self):
+        return self.get_clock().now().nanoseconds * 1e-9
+
+    # --- inputs ----------------------------------------------------------------------------
+
+    def on_joint_state(self, msg):
+        if "lift_joint" in msg.name:
+            self.joint_state = msg
+
+    def on_odom(self, msg):
+        self.world_from_base = odom_pose(msg).astype(np.float32)
+        yaw = np.arctan2(self.world_from_base[1, 0], self.world_from_base[0, 0])
+        self.headings.append((stamp_seconds(msg.header.stamp), float(yaw)))
+
+    def heading_at(self, t):
+        if not self.headings:
+            return 0.0
+        stamps, yaws = zip(*self.headings)
+        return float(np.interp(t, stamps, np.unwrap(yaws)))
+
+    def on_cloud(self, topic, msg):
+        received = self.now()
+        stamp = stamp_seconds(msg.header.stamp)
+        if self.grid is None:
+            self.set_up(topic, msg)
+            return
+        if self.joint_state is None:
+            return
+        previous = self.last_stamp.get(topic)
+        if previous is not None and stamp - previous > 1.5 * FRAME_DURATION:
+            self.stats.count(f"dropped frames {topic}", round((stamp - previous) / FRAME_DURATION) - 1)
+        self.last_stamp[topic] = stamp
+
+        start = time.perf_counter()
+        xyz, ring = cloud_fields(msg)
+        moving, _, _ = self.robot.moving_model(self.joint_state)
+        with self.lock:
+            self.grid.add_frame(self.topics.index(topic), xyz, ring, stamp, moving)
+            self.grid.update(moving, self.world_from_base)
+        done = self.now()
+        sweep_end = stamp + FRAME_DURATION
+        self.stats.add(delivery=received - sweep_end, grid_update=time.perf_counter() - start,
+                       sweep_end_to_grid_ready=done - sweep_end)
+        if self.publish_labels:
+            labels = self.grid.labels()
+            header = Header(stamp=msg.header.stamp, frame_id=GRID_FRAME)
+            for name, publisher in self.label_pubs.items():
+                publisher.publish(xyz_cloud(header, self.centers[labels == int(PUBLISHED_LABELS[name])]))
+
+    def set_up(self, topic, msg):
+        """Build the grid once there's a frame from every LiDAR and TF has their mounts."""
+        self.first_clouds.setdefault(topic, [cloud_fields(msg)])
+        if len(self.first_clouds) < len(self.topics):
+            return
+        try:
+            mounts = [self.mount(LIDARS[t]) for t in self.topics]
+        except tf2_ros.TransformException as e:
+            self.get_logger().warn(f"No LiDAR mount in TF yet: {e}", throttle_duration_sec=2.0)
+            return
+        grid, _ = make_grid(mounts, [self.first_clouds[t] for t in self.topics], level=False,
+                            contamination_reach=self.reach, log=self.get_logger().info,
+                            overrides={"static_after": self.static_after})
+        self.centers = grid.grid.centers() if self.publish_labels else None
+        self.grid = grid
+        self.get_logger().info(f"Grid ready ({grid.grid.size:,} voxels); serving check_motion")
+
+    def mount(self, lidar_frame):
+        """base_footprint from a LiDAR's frame: from TF, or its calibrated joint origin."""
+        if lidar_frame in self.calibration:
+            parent, parent_from_lidar = self.calibration[lidar_frame]
+            return transform_matrix(self.tf_buffer.lookup_transform(GRID_FRAME, parent, Time()).transform) @ parent_from_lidar
+        return transform_matrix(self.tf_buffer.lookup_transform(GRID_FRAME, lidar_frame, Time()).transform)
+
+    # --- checks ------------------------------------------------------------------------------
+
+    def check_motion(self, request, response):
+        start = time.perf_counter()
+        points = request.trajectory.points
+        if self.grid is None or self.joint_state is None:
+            response.success, response.message = False, "the grid isn't ready yet"
+            return response
+        if len(points) < 2:
+            response.success, response.message = False, "a trajectory needs at least two points"
+            return response
+
+        # Each point as a planner configuration, filling in joints the trajectory leaves out.
+        q_now = joint_vector(self.joint_state)
+        index = {name: i for i, name in enumerate(request.trajectory.joint_names)}
+        configurations = []
+        for point in points:
+            q = q_now.copy()
+            for j, name in enumerate(JOINT_NAMES):
+                if name in index:
+                    q[j] = point.positions[index[name]]
+            configurations.append(q)
+
+        # Steps of at most the planner's check resolution, each tagged with its segment.
+        samples, segment_of_step = [configurations[0]], []
+        for segment, (a, b) in enumerate(zip(configurations[:-1], configurations[1:])):
+            n = max(1, int(np.ceil(np.max(np.abs(b - a) / self.resolution))))
+            for k in range(1, n + 1):
+                samples.append(a + (b - a) * (k / n))
+                segment_of_step.append(segment)
+        bodies = [self.planned_robot.planning_body(q) for q in samples]
+        braking = step_braking(samples)
+        posed = time.perf_counter()
+
+        with self.lock:
+            oldest = self.grid.oldest_stamp()
+            age = self.now() - oldest
+            if age > self.stale_after:
+                response.success = False
+                response.message = f"the grid is {age:.2f} s old (a LiDAR may have stopped)"
+                return response
+            theta_slack = abs(self.heading_at(self.now()) - self.heading_at(oldest))
+            steps = self.checker.check(self.grid, bodies, age, theta_slack, braking)
+        checked = time.perf_counter()
+
+        n_segments = len(points) - 1
+        min_duration = np.zeros(n_segments)
+        speed = np.full(n_segments, np.inf)
+        shape = [""] * n_segments
+        clear_occupied = np.full(n_segments, np.inf)
+        clear_moving = np.full(n_segments, np.inf)
+        clear_unsafe = np.full(n_segments, np.inf)
+        blocked = [False] * n_segments
+        unsafe = [False] * n_segments
+        slowest_step = np.full(n_segments, -np.inf)
+        for step, segment in zip(steps, segment_of_step):
+            min_duration[segment] += step.min_duration
+            clear_occupied[segment] = min(clear_occupied[segment], step.clearance_occupied)
+            clear_moving[segment] = min(clear_moving[segment], step.clearance_moving)
+            clear_unsafe[segment] = min(clear_unsafe[segment], step.clearance_unsafe)
+            blocked[segment] |= step.blocked
+            unsafe[segment] |= step.unsafe
+            if step.shape >= 0 and step.min_duration > slowest_step[segment]:
+                slowest_step[segment] = step.min_duration
+                speed[segment] = step.speed
+                shape[segment] = self.names[step.shape]
+
+        response.success = True
+        response.message = f"{len(steps)} steps, data age {age:.3f} s, theta slack {theta_slack:.4f} rad"
+        response.min_duration = min_duration.tolist()
+        response.limiting_speed = np.where(np.isfinite(speed), speed, 0.0).tolist()
+        response.limiting_shape = shape
+        response.clearance_occupied = clear_occupied.tolist()
+        response.clearance_moving = clear_moving.tolist()
+        response.clearance_unsafe = clear_unsafe.tolist()
+        response.blocked = blocked
+        response.unsafe = unsafe
+        response.grid_stamp = Time(seconds=oldest).to_msg()
+        response.grid_age = float(age)
+        self.stats.add(check_posing=posed - start, check_grid=checked - posed,
+                       check_total=time.perf_counter() - start, check_grid_age=age)
+        return response
+
+    # --- reporting ----------------------------------------------------------------------------
+
+    def report(self):
+        summary = self.stats.summary()
+        if not summary:
+            return
+        status = DiagnosticStatus(name="obstacle_grid timing", level=DiagnosticStatus.OK,
+                                  values=[KeyValue(key=k, value=v) for k, v in summary.items()])
+        self.timing_pub.publish(DiagnosticArray(header=Header(stamp=self.get_clock().now().to_msg()), status=[status]))
+        self.get_logger().info("Timing: " + "; ".join(f"{k}: {v}" for k, v in summary.items()))
+
+
+def main():
+    rclpy.init()
+    node = ObstacleMonitor()
+    executor = MultiThreadedExecutor(num_threads=4)
+    executor.add_node(node)
+    try:
+        executor.spin()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        rclpy.try_shutdown()
+
+
+if __name__ == "__main__":
+    main()

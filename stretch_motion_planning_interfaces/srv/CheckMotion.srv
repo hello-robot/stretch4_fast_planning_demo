@@ -1,0 +1,33 @@
+# Check a stretch of planned motion against the obstacle grid: how long must each segment
+# take, given what's around the robot now? Answered by stretch_obstacle_grid's
+# obstacle_monitor_node.
+#
+# Joints use the driver's command names (as in PlanJointTrajectory). The first point is where
+# the motion starts, usually the robot's current state. Joints a trajectory leaves out are
+# filled in from /joint_states. mobile_base_rotation_joint is relative to the base's heading
+# when the request is sent. Points may be far apart: the node checks in steps of the
+# planner's check_resolution and adds the results up per segment.
+trajectory_msgs/JointTrajectory trajectory
+---
+bool success
+string message
+
+# Per segment (between consecutive points), from the slowest step within it:
+# min_duration: the segment may take no less than this (s). Its planned time is
+#   time_from_start[i + 1] - time_from_start[i]; anything shorter must be slowed down.
+float32[] min_duration
+# Speed allowed at the limiting piece of the robot (m/s), and the shape it belongs to.
+float32[] limiting_speed
+string[] limiting_shape
+# Smallest clearances over the segment's moving pieces (m, lower bounds) to any obstacle, to
+# obstacles that may move, and to unsafe space (unknown or contaminated shadow).
+float32[] clearance_occupied
+float32[] clearance_moving
+float32[] clearance_unsafe
+# The segment sweeps an obstacle (replan), or unsafe space (contact speed, sensitive mode).
+bool[] blocked
+bool[] unsafe
+
+# Start time of the oldest LiDAR frame behind the answer, and how old it was (s).
+builtin_interfaces/Time grid_stamp
+float32 grid_age

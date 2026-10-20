@@ -45,8 +45,10 @@ install(TARGETS ${PROJECT_NAME} LIBRARY DESTINATION ${PYTHON_INSTALL_DIR})
 
 install(DIRECTORY include/ DESTINATION include)
 install(TARGETS ${PROJECT_NAME}_core EXPORT export_${PROJECT_NAME} ARCHIVE DESTINATION lib)
-# Debug tools (Python): a bag replay with timing and pictures, and an RViz view.
-install(PROGRAMS tools/replay_bag.py tools/grid_viz_node.py tools/calibrate_lidars.py DESTINATION lib/${PROJECT_NAME})
+# The obstacle monitor (the grid on the robot, answering check_motion), and debug tools: a bag
+# replay with timing and pictures, an RViz view, and LiDAR calibration.
+install(PROGRAMS tools/obstacle_monitor_node.py tools/replay_bag.py tools/grid_viz_node.py tools/calibrate_lidars.py
+  DESTINATION lib/${PROJECT_NAME})
 install(FILES tools/grid_setup.py DESTINATION lib/${PROJECT_NAME})
 install(DIRECTORY rviz DESTINATION share/${PROJECT_NAME})
 

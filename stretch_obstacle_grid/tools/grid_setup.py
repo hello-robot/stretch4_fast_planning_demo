@@ -184,9 +184,9 @@ class RobotShapes:
     planning_body is the whole body that can sweep through anything, for checking motion."""
 
     def __init__(self):
-        config = load_config(os.path.join(get_package_share_directory("stretch_motion_planning"),
-                                          "config", "stretch4_collision_primitives.yaml"))
-        self.model = StretchCollisionModel(config)
+        self.config = load_config(os.path.join(get_package_share_directory("stretch_motion_planning"),
+                                               "config", "stretch4_collision_primitives.yaml"))
+        self.model = StretchCollisionModel(self.config)
 
     def static_model(self):
         shapes = []
