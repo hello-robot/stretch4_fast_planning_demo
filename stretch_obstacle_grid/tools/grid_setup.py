@@ -95,6 +95,14 @@ def ring_elevations(xyz, ring):
     return per_ring.astype(np.float32)
 
 
+def load_ring_elevations(path):
+    """Each ring's elevation (rad) from a LiDAR calibration CSV with an Elevation column (deg),
+    one row per ring in ring order (as stretch4_mujoco's lidar_calibration.csv)."""
+    import csv
+    with open(path) as f:
+        return np.deg2rad([float(row["Elevation"]) for row in csv.DictReader(f)]).astype(np.float32)
+
+
 def level_to_floor(base_from_lidar, clouds, r_range=(0.4, 1.8)):
     """Correct a LiDAR's mount so the floor it sees is the plane z = 0 of base_footprint.
 
@@ -147,20 +155,26 @@ def load_calibration(path):
 
 # --- The grid --------------------------------------------------------------------------------
 
-def make_grid(base_from_lidars, first_clouds, level=True, contamination_reach=None, log=print, overrides=None):
+def make_grid(base_from_lidars, first_clouds, level=True, contamination_reach=None, log=print, overrides=None,
+              ring_elevations_table=None, azimuth_bins=720):
     """(an ObstacleGrid for the LiDARs with the robot's static body set, the LiDAR mounts it
     uses after leveling).
 
     base_from_lidars: one 4x4 per LiDAR (from TF). first_clouds: per LiDAR, a few
     [(xyz, ring), ...] from the start, for ring elevations and leveling. overrides: {name:
-    value} for other ObstacleGridParams, for experiments."""
+    value} for other ObstacleGridParams, for experiments. ring_elevations_table: each ring's
+    elevation (rad), for every LiDAR, instead of measuring them from the first clouds (the
+    sim's upward rings return nothing in an open room). azimuth_bins: range image columns; at
+    most the LiDAR's firings per turn, so every column gets returns."""
     models, mounts = [], []
     for i, (base_from_lidar, clouds) in enumerate(zip(base_from_lidars, first_clouds)):
         if level:
             base_from_lidar, tilt, height = level_to_floor(base_from_lidar, clouds)
             log(f"LiDAR {i}: leveled to the floor, removing {tilt:.2f} deg of tilt and {100 * height:+.1f} cm of height")
         xyz, ring = clouds[0]
-        models.append(og.LidarModel(base_from_lidar.astype(np.float32), ring_elevations(xyz, ring)))
+        elevations = (np.asarray(ring_elevations_table, dtype=np.float32) if ring_elevations_table is not None
+                      else ring_elevations(xyz, ring))
+        models.append(og.LidarModel(base_from_lidar.astype(np.float32), elevations, azimuth_bins))
         mounts.append(base_from_lidar)
 
     params = og.ObstacleGridParams()

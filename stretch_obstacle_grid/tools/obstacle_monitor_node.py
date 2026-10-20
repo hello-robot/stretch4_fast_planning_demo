@@ -34,6 +34,12 @@ Parameters:
   threads (0): OpenMP threads for the grid's parallel loops, 0 for every core. Idle threads
       sleep (OMP_WAIT_POLICY=passive), so they don't take CPU from the drivers between loops.
   publish_labels (false), report_period (5.0)
+  ring_elevations_file (""): a LiDAR calibration CSV (Elevation column, deg, one row per ring)
+      to take ring elevations from instead of measuring them from the first frames. For the
+      MuJoCo sim, whose upward rings return nothing in an open room:
+      stretch4_mujoco/models/stretch_4/lidar_calibration.csv.
+  azimuth_bins (720): range image columns per turn. The real Hesai fires 901 times a turn;
+      the sim traces 250, so use 250 there (empty columns read as unseen space).
   calibration_file (""): a stretch_calibration_values.yaml with LiDAR joint origins to use
       instead of TF's mounts, for bags recorded before the robot was calibrated.
 """
@@ -61,8 +67,8 @@ from sensor_msgs.msg import JointState, PointCloud2
 from std_msgs.msg import Header
 
 import stretch_obstacle_grid as og
-from grid_setup import (GRID_FRAME, LIDARS, RobotShapes, cloud_fields, joint_vector, load_calibration, make_grid,
-                        odom_pose, step_braking, transform_matrix)
+from grid_setup import (GRID_FRAME, LIDARS, RobotShapes, cloud_fields, joint_vector, load_calibration,
+                        load_ring_elevations, make_grid, odom_pose, step_braking, transform_matrix)
 from grid_viz_node import PUBLISHED_LABELS, xyz_cloud
 from stretch_motion_planning.collision_model import JOINT_NAMES
 from stretch_motion_planning_interfaces.srv import CheckMotion
@@ -118,6 +124,9 @@ class ObstacleMonitor(Node):
         self.publish_labels = self.declare_parameter("publish_labels", False).value
         report_period = self.declare_parameter("report_period", 5.0).value
         calibration_file = self.declare_parameter("calibration_file", "").value
+        ring_file = self.declare_parameter("ring_elevations_file", "").value
+        self.ring_elevations = load_ring_elevations(ring_file) if ring_file else None
+        self.azimuth_bins = self.declare_parameter("azimuth_bins", 720).value
         self.calibration = load_calibration(calibration_file) if calibration_file else {}
         limits = og.MotionLimits()
         limits.latency = self.declare_parameter("latency", 0.15).value
@@ -239,7 +248,8 @@ class ObstacleMonitor(Node):
         grid, _ = make_grid(mounts, [self.first_clouds[t] for t in self.topics], level=False,
                             contamination_reach=self.reach, log=self.get_logger().info,
                             overrides={"static_after": self.static_after, "threads": self.threads,
-                                       **({"table_threads": self.threads} if self.threads else {})})
+                                       **({"table_threads": self.threads} if self.threads else {})},
+                            ring_elevations_table=self.ring_elevations, azimuth_bins=self.azimuth_bins)
         self.centers = grid.grid.centers() if self.publish_labels else None
         self.grid = grid
         self.get_logger().info(f"Grid ready ({grid.grid.size:,} voxels); serving check_motion")
