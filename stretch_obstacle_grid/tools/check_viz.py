@@ -271,7 +271,7 @@ class PlanRecord:
 class CheckDisplay:
     """Keeps the latest check, fading leftovers of blocks, and plans; draws them on demand."""
 
-    def __init__(self, voxel_size, fade_time=3.0, plan_fade_time=10.0, check_timeout=0.5):
+    def __init__(self, voxel_size, fade_time=0.5, plan_fade_time=10.0, check_timeout=0.5):
         self.voxel_size = voxel_size
         self.fade_time = fade_time
         self.plan_fade_time = plan_fade_time

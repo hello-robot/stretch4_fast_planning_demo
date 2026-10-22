@@ -38,7 +38,7 @@ Parameters:
   threads (0): OpenMP threads for the grid's parallel loops, 0 for every core. Idle threads
       sleep (OMP_WAIT_POLICY=passive), so they don't take CPU from the drivers between loops.
   publish_labels (false), report_period (5.0)
-  publish_checks (true): see Outputs. fade_time (3.0): s a block's leftovers take to fade
+  publish_checks (true): see Outputs. fade_time (0.5): s an obstacle voxel takes to fade
       once checks stop showing it. plan_fade_time (10.0): likewise for a replaced plan.
   ring_elevations_file (""): a LiDAR calibration CSV (Elevation column, deg, one row per ring)
       to take ring elevations from instead of measuring them from the first frames. For the
@@ -132,7 +132,7 @@ class ObstacleMonitor(Node):
         self.stale_after = self.declare_parameter("stale_after", 0.5).value
         self.publish_labels = self.declare_parameter("publish_labels", False).value
         self.publish_checks = self.declare_parameter("publish_checks", True).value
-        self.fade_time = self.declare_parameter("fade_time", 3.0).value
+        self.fade_time = self.declare_parameter("fade_time", 0.5).value
         self.plan_fade_time = self.declare_parameter("plan_fade_time", 10.0).value
         report_period = self.declare_parameter("report_period", 5.0).value
         calibration_file = self.declare_parameter("calibration_file", "").value
