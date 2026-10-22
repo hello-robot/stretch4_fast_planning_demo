@@ -45,9 +45,9 @@ from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 from hello_helpers.stretch4_ros_api import StretchTrajectoryActionServer
 from stretch_motion_planning_interfaces.srv import CheckMotion
 
-from stretch_dynamic_trajectory.timing import (CheckResult, ResumeGate, Trajectory, blocked_anywhere, creep_scale,
-                                               scale_deceleration, segment_caps, step_scale, stopping_for_block,
-                                               target_scale)
+from stretch_dynamic_trajectory.timing import (CheckResult, ResumeGate, Trajectory, blocked_anywhere,
+                                               creeping_limits, scale_deceleration, segment_caps, step_scale,
+                                               stopping_for_block, target_scale)
 
 WRIST_JOINTS = ("wrist_yaw_joint", "wrist_pitch_joint", "wrist_roll_joint")
 # m a point of the robot moves per unit of each joint's motion, at most, for bounding the
@@ -94,11 +94,13 @@ class DynamicTrajectoryActionServer(StretchTrajectoryActionServer):
         add_param("max_scale_up_rate", 2.0)
         # After the checks stop the robot for a blocked path, keep it stopped for resume_delay
         # s, then let it creep toward the block at no more than creep_speed (m/s at any point of
-        # the robot), and back to full speed once resume_clear_checks checks in a row see
-        # nothing blocked and resume_delay s have passed since the last one that did.
+        # the robot), speeding up and braking for the block at creep_acceleration (m/s^2), and
+        # back to full speed once resume_clear_checks checks in a row see nothing blocked and
+        # resume_delay s have passed since the last one that did.
         add_param("resume_clear_checks", 3)
         add_param("resume_delay", 0.5)
         add_param("creep_speed", 0.02)
+        add_param("creep_acceleration", 0.1)
         # Progress along the path slows as the robot falls behind it, and stops once a joint is
         # this many of its tolerances behind (it can't keep up, or something holds it), so the
         # desired state never runs away from the robot.
@@ -236,7 +238,7 @@ class DynamicTrajectoryActionServer(StretchTrajectoryActionServer):
         max_rate, max_up_rate = self.get_param("max_scale_rate"), self.get_param("max_scale_up_rate")
         gate = ResumeGate(self.get_param("resume_clear_checks"), self.get_param("resume_delay"))
         gated_stamp = None  # the last check counted by the gate
-        creep_speed = self.get_param("creep_speed")
+        creep_speed, creep_acceleration = self.get_param("creep_speed"), self.get_param("creep_acceleration")
         levers = np.array([CREEP_LEVERS.get(j, 1.0) for j in joints])
         check_timeout = self.get_param("check_timeout")
         max_lag = self.get_param("max_lag_tolerances")
@@ -263,11 +265,14 @@ class DynamicTrajectoryActionServer(StretchTrajectoryActionServer):
             if check is not None and check.stamp != gated_stamp:
                 gated_stamp = check.stamp
                 gate.update(check.stamp, stopping_for_block(check, target), blocked_anywhere(check))
+            up_rate = max_up_rate
             if gate.state == ResumeGate.STOPPED:
                 target = 0.0
             elif gate.state == ResumeGate.CREEPING:
-                target = min(target, creep_scale(plan, tau, horizon_end, creep_speed, levers))
-            scale = step_scale(scale, target, rate_limit, dt, up_rate=max_up_rate)
+                creep_target, creep_rate = creeping_limits(plan, tau, horizon_end, check, creep_speed,
+                                                           creep_acceleration, levers)
+                target, up_rate = min(target, creep_target), min(up_rate, creep_rate)
+            scale = step_scale(scale, target, rate_limit, dt, up_rate=up_rate)
 
             # Advance along the plan more slowly the further the robot lags behind it, and not
             # at all past max_lag tolerances.

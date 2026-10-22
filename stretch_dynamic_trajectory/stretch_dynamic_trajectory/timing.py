@@ -152,6 +152,17 @@ def creep_scale(trajectory, tau0, tau1, speed, levers):
     return 1.0 if top <= speed else speed / top
 
 
+def creeping_limits(trajectory, tau, tau1, check, speed, acceleration, levers):
+    """(target scale, the most it may rise per s) while creeping toward a block: no point of the
+    robot faster than `speed` (m/s), and speeding up and braking for what the check says is
+    ahead at no more than `acceleration` (m/s^2 at the fastest point), so each creep is a smooth
+    step rather than a jerk (Elaine, 2026-10-22). Slowing for a block that appears right ahead
+    is still up to the caller's usual rate."""
+    cap = creep_scale(trajectory, tau, tau1, speed, levers)
+    rate = acceleration * cap / speed
+    return min(target_scale(tau, check, rate, trajectory.duration), cap), rate
+
+
 class ResumeGate:
     """What the robot may do after the checks stop it for a blocked path (Elaine, 2026-10-22:
     stop, then edge slowly toward the obstacle while there's still some clear space, then stop
