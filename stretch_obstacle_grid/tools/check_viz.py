@@ -6,12 +6,14 @@ For the latest check (the motion the trajectory server asked about, about 1 s ah
     yellow slowed for an obstacle's distance, orange sweeping unsafe space (contact speed),
     red blocked;
   - at the step that matters most (the first blocked one, else the first unsafe one, else the
-    slowest), a ghost of the robot's shapes that have moved by then (or move in the step) and a
-    label saying why;
-  - the voxels behind a blocked or unsafe step, as cubes of a voxel's average size: a block's
-    colored by which LiDAR saw them, unsafe space's by label.
-A block's voxels and ghost turn grey and fade out over fade_time once checks stop showing
-them, so a block that flickers for one check stays visible long enough to look at. Plans are
+    slowest), a ghost of just the shapes that hit something there (or the limiting shape, if
+    only slowed), and a label by the arm with the state and how far ahead it is, e.g.
+    "BLOCKED: 0.4 s";
+  - the voxels behind it, in the same color, as cubes of a voxel's average size: the obstacle
+    voxels a blocked step sweeps, or the unsafe voxels an unsafe step sweeps plus the obstacles
+    within contamination reach of its contaminated shadow (what contaminated it).
+Obstacle voxels turn grey and fade out over fade_time once checks stop showing them, so one
+that flickers for one check stays visible long enough to look at. Plans are
 drawn as lines through the wrist and fingertip with a faint ghost at the end; a plan that's
 replaced (a new goal, or later a replan) turns grey and fades out over plan_fade_time.
 
@@ -32,14 +34,11 @@ import stretch_obstacle_grid as og
 CLEAR, SLOWED, UNSAFE, BLOCKED = range(4)
 STATUS_NAMES = {CLEAR: "clear", SLOWED: "slowed", UNSAFE: "unsafe", BLOCKED: "blocked"}
 STEP_COLORS = {CLEAR: (0.2, 0.8, 0.2), SLOWED: (1.0, 0.85, 0.1), UNSAFE: (1.0, 0.5, 0.0), BLOCKED: (0.9, 0.1, 0.1)}
-# Block voxels by which LiDARs' latest frames have a return in them (bit i: LiDAR i). Neither:
-# an obstacle kept from older frames (static).
-SEEN_BY_COLORS = {0: (1.0, 1.0, 1.0), 1: (0.9, 0.2, 0.9), 2: (0.1, 0.8, 0.9), 3: (0.9, 0.1, 0.1)}
-UNSAFE_COLORS = {int(og.UNKNOWN): (0.6, 0.6, 0.8), int(og.CONTAMINATED_SHADOW): (0.96, 0.65, 0.51)}
 STALE_COLOR = (0.55, 0.55, 0.55)
 PLAN_COLOR = (0.4, 0.6, 1.0)
 LINE_WIDTH = 0.008  # m
-TEXT_HEIGHT = 0.04  # m
+TEXT_HEIGHT = 0.05  # m
+TEXT_ABOVE_ARM = 0.1  # m
 SHAPE_KINDS = {"box": Marker.CUBE, "cylinder": Marker.CYLINDER, "capsule": Marker.CYLINDER, "sphere": Marker.SPHERE}
 
 
@@ -131,11 +130,13 @@ class Focus:
     """The step a check is limited by, and what limits it."""
     step: int
     status: int
-    shapes: list            # og.SelfShapes at the end of the step
+    shapes: list            # og.SelfShapes that hit something there (or the limiting one), at the step's end
     text: str
+    anchor: np.ndarray      # where the label goes: the arm's center now, base_footprint
     voxels: np.ndarray      # (n,) voxel indices behind it (none if only slowed)
     centers: np.ndarray     # (n, 3) their centers, base_footprint
-    colors: list            # (r, g, b, a) per voxel; voxels at the edge (StepHit.in_both false) fainter
+    alphas: np.ndarray      # (n,) fainter for voxels at the edge (StepHit.in_both false)
+    fades: np.ndarray       # (n,) bool: an obstacle voxel, left fading when it stops showing
 
 
 @dataclasses.dataclass
@@ -148,25 +149,44 @@ class CheckRecord:
     focus: Focus = None
 
 
-def focus_text(status, step, start_time, shape, hits=None, seen_by=None, labels=None, lidar_names=("left", "right"),
-               cap=1.0):
-    """What a check's focus says, on two lines, e.g. "BLOCKED 0.40 s ahead: gripper_box" and
-    "6 voxels (right 6)"."""
-    head = f"{STATUS_NAMES[status].upper()} {start_time:.2f} s ahead: {shape}\n"
-    if status == SLOWED:
-        return (f"{head}{100 * cap:.0f}% speed: {step.clearance_moving:.2f} m from a moving obstacle, "
-                f"{step.clearance_occupied:.2f} m from any")
-    n = len(hits)
-    edge = sum(not h.in_both for h in hits)
-    edge_text = f", {edge} at the edge" if edge else ""
-    if status == BLOCKED:
-        counts = collections.Counter(int(b) for b in seen_by)
-        parts = [f"{' + '.join(lidar_names[i] for i in range(len(lidar_names)) if bits >> i & 1) or 'older frames'} "
-                 f"{count}" for bits, count in sorted(counts.items())]
-        return f"{head}{n} voxels ({', '.join(parts)}{edge_text})"
-    counts = collections.Counter(int(v) for v in labels)
-    return (f"{head}{n} voxels unsafe ({counts.get(int(og.UNKNOWN), 0)} unknown, "
-            f"{counts.get(int(og.CONTAMINATED_SHADOW), 0)} contaminated{edge_text})")
+def focus_text(status, start_time):
+    """The label: the state and how far ahead (s of planned motion), e.g. "BLOCKED: 0.4 s"."""
+    return f"{STATUS_NAMES[status].upper()}: {start_time:.1f} s"
+
+
+def make_focus(k, status, bodies, names, steps, start_times, hits=(), centers=None, sources=(), max_voxels=3000):
+    """The Focus of a check at step k. hits: the step's StepHits (blocked or unsafe); sources:
+    voxel indices of obstacles behind contaminated shadow among them. At most max_voxels voxels."""
+    end = bodies[k + 1].shapes()
+    if hits:
+        shapes = [end[i] for i in sorted({h.shape for h in hits})]
+    else:
+        shapes = [end[steps[k].shape]] if steps[k].shape >= 0 else []
+    arm = np.asarray(bodies[0].shapes()[names.index("arm")].pose, dtype=float)[:3, 3]
+    hits = list(hits)[:max_voxels]
+    sources = np.asarray(sources, dtype=np.int64)[:max(0, max_voxels - len(hits))]
+    voxels = np.r_[np.array([h.voxel for h in hits], dtype=np.int64), sources]
+    alphas = np.r_[[0.9 if h.in_both else 0.4 for h in hits], np.full(len(sources), 0.9)]
+    fades = np.r_[np.full(len(hits), status == BLOCKED), np.ones(len(sources), dtype=bool)]
+    return Focus(step=k, status=status, shapes=shapes, text=focus_text(status, start_times[k]),
+                 anchor=arm + [0.0, 0.0, TEXT_ABOVE_ARM], voxels=voxels,
+                 centers=centers[voxels] if len(voxels) else np.zeros((0, 3)), alphas=alphas, fades=fades)
+
+
+def contamination_sources(contaminated, obstacles, reach):
+    """Indices into `obstacles` ((m, 3) centers) within `reach` m of any of `contaminated`
+    ((n, 3) centers): the obstacles a contaminated shadow can have spread from. Contamination
+    spreads through the shadow, so its path is at least this straight-line distance."""
+    contaminated, obstacles = np.asarray(contaminated, dtype=float), np.asarray(obstacles, dtype=float)
+    if not len(contaminated) or not len(obstacles):
+        return np.zeros(0, dtype=np.int64)
+    lo, hi = contaminated.min(axis=0) - reach, contaminated.max(axis=0) + reach
+    near = np.flatnonzero(np.all((obstacles >= lo) & (obstacles <= hi), axis=1))
+    found = np.zeros(len(near), dtype=bool)
+    for chunk in np.array_split(contaminated, max(1, len(contaminated) // 256)):
+        d2 = ((obstacles[near, None, :] - chunk[None, :, :]) ** 2).sum(axis=2)
+        found |= (d2 <= reach * reach).any(axis=1)
+    return near[found]
 
 
 # --- Markers -------------------------------------------------------------------------------
@@ -228,10 +248,8 @@ def voxel_cubes(header, ns, marker_id, centers, colors, size, transform):
     return m
 
 
-def text_marker(header, ns, marker_id, text, shapes, rgba, transform, fallback=(0.0, 0.0, 1.0)):
-    """Text above a ghost's shapes (or at `fallback`, base_footprint, if there are none)."""
-    tops = np.array([np.asarray(s.pose, dtype=float)[:3, 3] for s in shapes]) if shapes else np.array([fallback])
-    at = np.r_[tops[:, :2].mean(axis=0), tops[:, 2].max() + 0.12]
+def text_marker(header, ns, marker_id, text, at, rgba, transform):
+    """Text at `at` (base_footprint)."""
     # RViz (jazzy) draws a space in a text marker several letters wide; a tab reads as a space.
     m = Marker(header=header, ns=ns, id=marker_id, type=Marker.TEXT_VIEW_FACING, action=Marker.ADD,
                color=rgba, text=text.replace(" ", "\t"))
@@ -250,14 +268,6 @@ class PlanRecord:
     replaced_at: float = None
 
 
-@dataclasses.dataclass
-class StaleBlock:
-    since: float            # s, when checks stopped showing it
-    heading: float
-    shapes: list
-    text: str
-
-
 class CheckDisplay:
     """Keeps the latest check, fading leftovers of blocks, and plans; draws them on demand."""
 
@@ -268,7 +278,6 @@ class CheckDisplay:
         self.check_timeout = check_timeout  # s; an older check is no longer current
         self.check = None
         self.stale_voxels = {}  # voxel index -> (center, heading, since)
-        self.stale_blocks = []
         self.plans = []         # the newest last; earlier ones fading
 
     def add_check(self, record):
@@ -276,8 +285,8 @@ class CheckDisplay:
         self.check = record
         if old is not None:
             self._retire(old, record.stamp, still=record.focus)
-        if record.focus is not None and record.focus.status == BLOCKED:
-            for v in record.focus.voxels:
+        if record.focus is not None:
+            for v in record.focus.voxels[record.focus.fades]:
                 self.stale_voxels.pop(int(v), None)
 
     def add_plan(self, record, now):
@@ -287,17 +296,15 @@ class CheckDisplay:
         self.plans.append(record)
 
     def _retire(self, record, now, still=None):
-        """A check's block, no longer current, starts fading: its voxels that `still` (the new
-        check's focus) doesn't show, and its ghost unless the new check is blocked too."""
+        """A check, no longer current: its obstacle voxels that `still` (the new check's focus)
+        doesn't show start fading."""
         focus = record.focus
-        if focus is None or focus.status != BLOCKED:
+        if focus is None:
             return
-        current = set() if still is None or still.status != BLOCKED else {int(v) for v in still.voxels}
-        for v, c in zip(focus.voxels, focus.centers):
+        current = set() if still is None else {int(v) for v in still.voxels[still.fades]}
+        for v, c in zip(focus.voxels[focus.fades], focus.centers[focus.fades]):
             if int(v) not in current:
                 self.stale_voxels[int(v)] = (c, record.heading, now)
-        if still is None or still.status != BLOCKED:
-            self.stale_blocks.append(StaleBlock(now, record.heading, focus.shapes, focus.text))
 
     def markers(self, header, now, heading_now):
         """Markers for everything still showing, after a DELETEALL (so nothing lingers)."""
@@ -325,7 +332,7 @@ class CheckDisplay:
             out.append(path_lines(header, "plan", i, plan.wrist, plan.tip, transform, [color(rgb, line_alpha)] * n))
             out += shape_markers(header, plan.end_shapes, f"plan_end_{i}", color(rgb, ghost_alpha), transform)
 
-        # Blocks no longer shown, fading.
+        # Obstacle voxels no longer shown, fading.
         self.stale_voxels = {v: s for v, s in self.stale_voxels.items() if fading(s[2], self.fade_time) > 0}
         if self.stale_voxels:
             by_heading = collections.defaultdict(list)
@@ -334,13 +341,6 @@ class CheckDisplay:
             for i, (heading, items) in enumerate(by_heading.items()):
                 out.append(voxel_cubes(header, "stale_voxels", i, [c for c, _ in items], [k for _, k in items],
                                        self.voxel_size, placed(heading)))
-        self.stale_blocks = [b for b in self.stale_blocks if fading(b.since, self.fade_time) > 0][-5:]
-        for i, block in enumerate(self.stale_blocks):
-            fade = fading(block.since, self.fade_time)
-            transform = placed(block.heading)
-            out += shape_markers(header, block.shapes, f"stale_ghost_{i}", color(STALE_COLOR, 0.25 * fade), transform)
-            out.append(text_marker(header, "stale_text", i, block.text, block.shapes,
-                                   color(STALE_COLOR, fade), transform))
 
         # The current check.
         check = self.check
@@ -351,38 +351,10 @@ class CheckDisplay:
             focus = check.focus
             if focus is not None:
                 rgb = STEP_COLORS[focus.status]
-                out += shape_markers(header, focus.shapes, "check_ghost", color(rgb, 0.3), transform)
-                out.append(text_marker(header, "check_text", 0, focus.text, focus.shapes, color(rgb, 1.0), transform))
+                out += shape_markers(header, focus.shapes, "check_ghost", color(rgb, 0.35), transform)
+                out.append(text_marker(header, "check_text", 0, focus.text, focus.anchor, color(rgb, 1.0), transform))
                 if len(focus.voxels):
                     out.append(voxel_cubes(header, "check_voxels", 0, focus.centers,
-                                           [color(c[:3], c[3]) for c in focus.colors], self.voxel_size, transform))
+                                           [color(rgb, a) for a in focus.alphas], self.voxel_size, transform))
         return out
 
-
-def make_focus(k, status, bodies, names, steps, durations, start_times, hits=None, seen_by=None, labels=None,
-               centers=None, lidar_names=("left", "right"), max_voxels=3000):
-    """The Focus of a check at step k: StepHits with their LiDAR bits (seen_by), labels and
-    centers for a blocked or unsafe step. At most max_voxels voxels are drawn."""
-    step = steps[k]
-    cap = durations[k] / step.min_duration if step.min_duration > 0 else 1.0
-    hits = hits or []
-    text = focus_text(status, step, start_times[k], names[step.shape] if step.shape >= 0 else "?", hits,
-                      seen_by, labels, lidar_names, cap)
-    voxels = np.array([h.voxel for h in hits][:max_voxels], dtype=np.int64)
-    colors = []
-    for i, hit in enumerate(hits[:max_voxels]):
-        rgb = SEEN_BY_COLORS.get(int(seen_by[i]), SEEN_BY_COLORS[3]) if status == BLOCKED else \
-            UNSAFE_COLORS.get(int(labels[i]), STALE_COLOR)
-        colors.append((*rgb, 0.9 if hit.in_both else 0.4))
-    return Focus(step=k, status=status, shapes=moved_shapes(bodies, k), text=text, voxels=voxels,
-                 centers=centers[voxels] if len(voxels) else np.zeros((0, 3)), colors=colors)
-
-
-def moved_shapes(bodies, k, threshold=0.005):
-    """The shapes at the end of step k that have moved since the first sample or move during
-    the step (any corner more than threshold m): the ghost leaves out what stays put."""
-    def corners(shape):
-        return np.array(og.piece_corners(shape))
-    first, start, end = bodies[0].shapes(), bodies[k].shapes(), bodies[k + 1].shapes()
-    return [e for f, s, e in zip(first, start, end)
-            if max(np.abs(corners(e) - corners(f)).max(), np.abs(corners(e) - corners(s)).max()) > threshold]

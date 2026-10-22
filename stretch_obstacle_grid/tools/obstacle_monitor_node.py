@@ -16,7 +16,7 @@ Outputs:
       does, and obstacle_grid/robot_shapes (MarkerArray): the shapes the grid takes as the robot
       (for RViz; costs a few ms per frame)
   obstacle_grid/check_markers (MarkerArray, 10 Hz) with publish_checks: each check's path,
-      what limits it and the voxels behind a block, and the trajectory server's plan (from
+      what limits it and the voxels behind that, and the trajectory server's plan (from
       dynamic_trajectory_server_diagnostics/plan); see check_viz.py
 
 Every frame from either LiDAR (each sweeps at 10 Hz, about 35 ms apart) goes into the grid as
@@ -393,35 +393,38 @@ class ObstacleMonitor(Node):
 
     def check_to_draw(self, bodies, steps, step_starts, step_durations, theta_slack):
         """What draw_checks needs about a check, with the voxels behind its focus (call with
-        the grid locked)."""
+        the grid locked): a blocked step's obstacle voxels, or an unsafe step's unsafe voxels
+        and the obstacles within contamination reach of its contaminated ones."""
         statuses = check_viz.step_statuses(steps, step_durations)
         focus = check_viz.choose_focus(statuses, steps, step_durations)
-        hits, seen_by, labels = [], None, None
+        hits, sources = [], np.zeros(0, dtype=np.int64)
         if focus is not None and focus[1] in (check_viz.BLOCKED, check_viz.UNSAFE):
             kind = og.HitKind.OBSTACLES if focus[1] == check_viz.BLOCKED else og.HitKind.UNSAFE
             hits = self.checker.step_hits(self.grid, bodies, focus[0], kind, theta_slack)
-            voxels = [h.voxel for h in hits]
-            seen_by = self.grid.seen_by(voxels)
-            labels = self.grid.labels()[np.array(voxels, dtype=np.int64)]
+            if kind == og.HitKind.UNSAFE:
+                labels = self.grid.labels()
+                voxels = np.array([h.voxel for h in hits], dtype=np.int64)
+                contaminated = voxels[labels[voxels] == int(og.CONTAMINATED_SHADOW)]
+                obstacles = np.flatnonzero((labels == int(og.OCCUPIED)) | (labels == int(og.STATIC)))
+                found = check_viz.contamination_sources(self.centers[contaminated], self.centers[obstacles],
+                                                        self.reach + self.grid.grid.config.cell)
+                sources = obstacles[found]
         now = self.now()
         return dict(stamp=now, heading=self.heading_at(now), bodies=bodies, steps=steps, statuses=statuses,
-                    focus=focus, starts=step_starts, durations=step_durations, hits=hits, seen_by=seen_by,
-                    labels=labels)
+                    focus=focus, starts=step_starts, hits=hits, sources=sources)
 
     def draw_checks(self):
         if self.display is None:
             return
         start = time.perf_counter()
-        lidar_names = [t.rsplit("_", 1)[-1] for t in self.topics]
         while self.drawn_checks:
             c = self.drawn_checks.popleft()
             wrist, tip = check_viz.path_points(c["bodies"], self.names)
             focus = None
             if c["focus"] is not None:
                 k, status = c["focus"]
-                focus = check_viz.make_focus(k, status, c["bodies"], self.names, c["steps"], c["durations"],
-                                             c["starts"], c["hits"], c["seen_by"], c["labels"], self.centers,
-                                             lidar_names)
+                focus = check_viz.make_focus(k, status, c["bodies"], self.names, c["steps"], c["starts"], c["hits"],
+                                             self.centers, c["sources"])
             self.display.add_check(check_viz.CheckRecord(c["stamp"], c["heading"], wrist, tip, c["statuses"], focus))
         now = self.now()
         header = Header(frame_id=GRID_FRAME)  # stamp 0: the latest transform
