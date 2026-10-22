@@ -9,7 +9,11 @@ it runs, a background thread asks the obstacle monitor's check_motion about the 
 check_horizon seconds of the trajectory, about check_rate times a second, and the scale is
 kept low enough to be down to each segment's allowed speed when the robot gets there, to
 stop before a blocked segment, and to stop by the end of what's been checked. Without a fresh
-answer (check_timeout) the robot slows to a stop. Joints are commanded in velocity mode, like
+answer (check_timeout) the robot slows to a stop. Once the checks stop the robot for a blocked
+path, it's held until resume_clear_checks checks in a row let it go and resume_delay s have
+passed, and the scale never rises faster than max_scale_up_rate. Each check's details (which
+segment and shape limit the motion, clearances, blocked segments) are published on
+dynamic_trajectory_server_diagnostics/check. Joints are commanded in velocity mode, like
 the default server's adaptive_velocity mode: the scaled planned velocity plus kp times the
 position error, with the joint's maximum acceleration so the firmware follows each command.
 
@@ -28,6 +32,7 @@ import time
 import numpy as np
 from builtin_interfaces.msg import Duration as DurationMsg
 from control_msgs.action import FollowJointTrajectory
+from diagnostic_msgs.msg import DiagnosticArray, DiagnosticStatus, KeyValue
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
 from rclpy.parameter import Parameter
 from sensor_msgs.msg import JointState
@@ -37,8 +42,8 @@ from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 from hello_helpers.stretch4_ros_api import StretchTrajectoryActionServer
 from stretch_motion_planning_interfaces.srv import CheckMotion
 
-from stretch_dynamic_trajectory.timing import (CheckResult, Trajectory, scale_deceleration, segment_caps,
-                                               step_scale, target_scale)
+from stretch_dynamic_trajectory.timing import (CheckResult, ResumeGate, Trajectory, scale_deceleration,
+                                               segment_caps, step_scale, stopping_for_block, target_scale)
 
 WRIST_JOINTS = ("wrist_yaw_joint", "wrist_pitch_joint", "wrist_roll_joint")
 
@@ -61,6 +66,7 @@ class DynamicTrajectoryActionServer(StretchTrajectoryActionServer):
         self._check_client = driver.create_client(CheckMotion, "check_motion",
                                                   callback_group=MutuallyExclusiveCallbackGroup())
         self._pub_timing = driver.create_publisher(JointState, "dynamic_trajectory_server_diagnostics/timing", 10)
+        self._pub_check = driver.create_publisher(DiagnosticArray, "dynamic_trajectory_server_diagnostics/check", 10)
 
     def declare_params(self):
         super().declare_params()
@@ -74,8 +80,14 @@ class DynamicTrajectoryActionServer(StretchTrajectoryActionServer):
         add_param("check_step", 0.1)
         # s without a fresh check answer before slowing to a stop
         add_param("check_timeout", 0.3)
-        # the most the speed scale changes per s, whatever the joints could do
+        # the most the speed scale changes per s, whatever the joints could do; and the most it
+        # rises per s (0 to full speed in 0.5 s), so starting and resuming are gentle
         add_param("max_scale_rate", 5.0)
+        add_param("max_scale_up_rate", 2.0)
+        # After the checks stop the robot for a blocked path, hold it until this many checks in
+        # a row let it go and this many s have passed since the last blocking one.
+        add_param("resume_clear_checks", 3)
+        add_param("resume_delay", 0.5)
         # Progress along the path slows as the robot falls behind it, and stops once a joint is
         # this many of its tolerances behind (it can't keep up, or something holds it), so the
         # desired state never runs away from the robot.
@@ -210,7 +222,9 @@ class DynamicTrajectoryActionServer(StretchTrajectoryActionServer):
         tolerances = np.array([self._tolerance(j) for j in joints])
         wrists = [i for i, j in enumerate(joints) if j in WRIST_JOINTS]
         overspeed_since = {i: None for i in wrists}
-        max_rate = self.get_param("max_scale_rate")
+        max_rate, max_up_rate = self.get_param("max_scale_rate"), self.get_param("max_scale_up_rate")
+        gate = ResumeGate(self.get_param("resume_clear_checks"), self.get_param("resume_delay"))
+        gated_stamp = None  # the last check counted by the gate
         check_timeout = self.get_param("check_timeout")
         max_lag = self.get_param("max_lag_tolerances")
         catch_up_fraction, catch_up_floor = self.get_param("catch_up_fraction"), self.get_param("catch_up_floor")
@@ -233,7 +247,12 @@ class DynamicTrajectoryActionServer(StretchTrajectoryActionServer):
             rate_limit = scale_deceleration(plan, tau, min(plan.duration, tau + self.get_param("check_horizon")),
                                             max_acceleration, max_rate)
             target = target_scale(tau, check, rate_limit, plan.duration)
-            scale = step_scale(scale, target, rate_limit, dt)
+            if check is not None and check.stamp != gated_stamp:
+                gated_stamp = check.stamp
+                gate.update(check.stamp, stopping_for_block(check, target))
+            if gate.held:
+                target = 0.0
+            scale = step_scale(scale, target, rate_limit, dt, up_rate=max_up_rate)
 
             # Advance along the plan more slowly the further the robot lags behind it, and not
             # at all past max_lag tolerances.
@@ -264,7 +283,8 @@ class DynamicTrajectoryActionServer(StretchTrajectoryActionServer):
                     else:
                         self.driver.check_and_set_vel(joint, float(commands[i]), a=float(max_acceleration[i])
                                                       if np.isfinite(max_acceleration[i]) else None)
-            self._publish(goal_handle, joints, tau, scale, target, check, now, desired, actual, commands, start)
+            self._publish(goal_handle, joints, tau, scale, target, check, now, desired, actual, commands, start,
+                          gate.held)
             rate.sleep()
 
         # At the end of the path: settle on the last waypoint as the default server does.
@@ -296,7 +316,7 @@ class DynamicTrajectoryActionServer(StretchTrajectoryActionServer):
                 overspeed_since[i] = None
         return None
 
-    def _publish(self, goal_handle, joints, tau, scale, target, check, now, desired, actual, commands, start):
+    def _publish(self, goal_handle, joints, tau, scale, target, check, now, desired, actual, commands, start, held):
         feedback = FollowJointTrajectory.Feedback(joint_names=joints)
         feedback.desired = JointTrajectoryPoint(positions=list(desired), time_from_start=duration_msg(tau))
         feedback.actual = JointTrajectoryPoint(positions=list(actual), time_from_start=duration_msg(
@@ -308,8 +328,8 @@ class DynamicTrajectoryActionServer(StretchTrajectoryActionServer):
         self.pub_commands.publish(JointState(name=joints, velocity=[float(c) for c in commands]))
         # tau and the scale, as a JointState so it plots with the rest
         self._pub_timing.publish(JointState(
-            header=Header(stamp=stamp), name=["tau", "scale", "target_scale", "check_age"],
-            position=[tau, scale, target, (now - check.stamp) if check is not None else -1.0]))
+            header=Header(stamp=stamp), name=["tau", "scale", "target_scale", "check_age", "held"],
+            position=[tau, scale, target, (now - check.stamp) if check is not None else -1.0, float(held)]))
 
     # --- checks ----------------------------------------------------------------------------------
 
@@ -361,8 +381,32 @@ class DynamicTrajectoryActionServer(StretchTrajectoryActionServer):
         starts = np.array([tau] + taus[:-1])
         ends = np.array(taus)
         caps = segment_caps(ends - starts, response.min_duration, response.blocked)
+        self._publish_check(response, tau, starts, caps, time.monotonic() - stamp)
         return CheckResult(starts=starts, ends=ends, caps=caps, unsafe=np.array(response.unsafe, dtype=bool),
                            stamp=stamp)
+
+    def _publish_check(self, response, tau, starts, caps, round_trip):
+        """Why the motion ahead is limited: the most limiting segment (lowest cap) and the first
+        blocked one, with their shapes and clearances."""
+        def segment(prefix, i):
+            return [KeyValue(key=f"{prefix}_{name}", value=value) for name, value in [
+                ("segment", str(i)), ("tau", f"{starts[i]:.3f}"), ("cap", f"{caps[i]:.3f}"),
+                ("shape", response.limiting_shape[i]), ("speed", f"{response.limiting_speed[i]:.3f}"),
+                ("clearance_occupied", f"{response.clearance_occupied[i]:.3f}"),
+                ("clearance_moving", f"{response.clearance_moving[i]:.3f}"),
+                ("clearance_unsafe", f"{response.clearance_unsafe[i]:.3f}")]]
+
+        blocked = [i for i, b in enumerate(response.blocked) if b]
+        values = [KeyValue(key="tau", value=f"{tau:.3f}"), KeyValue(key="round_trip", value=f"{round_trip:.4f}"),
+                  KeyValue(key="grid_age", value=f"{response.grid_age:.3f}"),
+                  KeyValue(key="blocked", value=" ".join(map(str, blocked))),
+                  KeyValue(key="unsafe", value=" ".join(str(i) for i, u in enumerate(response.unsafe) if u))]
+        values += segment("limiting", int(np.argmin(caps)))
+        if blocked:
+            values += segment("first_blocked", blocked[0])
+        self._pub_check.publish(DiagnosticArray(
+            header=Header(stamp=self.driver.get_clock().now().to_msg()),
+            status=[DiagnosticStatus(name="dynamic_trajectory_server check", values=values)]))
 
     def _call(self, request, timeout):
         done = threading.Event()

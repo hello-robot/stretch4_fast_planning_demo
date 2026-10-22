@@ -9,7 +9,9 @@ run ahead and the robot rushing to catch up.
 The scale comes from obstacle checks of the motion ahead: each checked segment of trajectory
 time has a cap (planned time / the least time the check allows; 0 if the segment is blocked).
 The scale must be down to each cap by the time tau reaches that segment, braking no harder
-than the joints can, and it never runs past the end of what's been checked.
+than the joints can, and it never runs past the end of what's been checked. Once the checks
+have stopped the robot for a blocked path, it stays stopped until several checks in a row say
+it can go (ResumeGate), and then speeds up gently.
 """
 
 from dataclasses import dataclass, field
@@ -121,6 +123,41 @@ def scale_deceleration(trajectory, tau0, tau1, joint_decelerations, max_rate):
     return float(min(max_rate, np.min(rates)))
 
 
-def step_scale(scale, target, rate, dt):
-    """Move the scale toward target by at most rate * dt."""
-    return float(np.clip(target, scale - rate * dt, scale + rate * dt))
+def step_scale(scale, target, rate, dt, up_rate=None):
+    """Move the scale toward target by at most rate * dt (and when speeding up, also at most
+    up_rate * dt)."""
+    up = rate if up_rate is None else min(rate, up_rate)
+    return float(np.clip(target, scale - rate * dt, scale + up * dt))
+
+
+def stopping_for_block(check, target):
+    """Whether a check brings the robot to a stop for a blocked segment (not just slowing for
+    one further ahead): the target is 0 and a segment ahead is blocked."""
+    return target <= 1e-6 and bool(np.any(check.caps == 0.0))
+
+
+class ResumeGate:
+    """Holds the robot after the checks stop it for a blocked path, until clear_checks fresh
+    checks in a row let it go and at least delay s have passed since the last blocking one.
+
+    On the robot (2026-10-20), single checks came back clear between blocked ones while a hand
+    was in the way, and each one restarted the arm toward the hand at 60-70% speed.
+    """
+
+    def __init__(self, clear_checks, delay):
+        self.clear_checks = clear_checks
+        self.delay = delay
+        self.held = False
+        self._clear = 0
+        self._blocked_at = None
+
+    def update(self, stamp, blocking):
+        """Count one new check (stamp: when it was asked, s), which stops the robot for a block
+        or not; returns whether the robot is held."""
+        if blocking:
+            self.held, self._clear, self._blocked_at = True, 0, stamp
+        elif self.held:
+            self._clear += 1
+            if self._clear >= self.clear_checks and stamp - self._blocked_at >= self.delay:
+                self.held = False
+        return self.held
