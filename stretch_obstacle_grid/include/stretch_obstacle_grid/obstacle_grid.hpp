@@ -50,6 +50,15 @@ struct ObstacleGridParams
   float self_point_padding = 0.03f;  // m: returns this close to the robot's shapes are the robot
   float self_voxel_padding = 0.01f;  // m: voxels whose centers are this close are the robot
   float range_margin = 0.02f;        // m: range noise allowance when comparing rays to voxels
+  // A return from behind the robot whose beam passed within graze_margin (m) of a moving
+  // part's shape on the way is the robot's too, like a ghost from behind it. A beam that
+  // clips a narrow edge (the gripper fingers' white band, nearly edge-on to a LiDAR) returns
+  // a dim range between the edge and what's behind it, and the robot's neighboring beams may
+  // return nothing for the veil filter to see. Each such beam's whole length behind the edge
+  // becomes shadow, so this costs more than it sounds: on a bag (2026-10-22) 1 cm added 11%
+  // to the shadow for the moving parts, and 42% if the static parts (base, mast, head) had it
+  // too. They're fixed and calibrated against the LiDARs, so they don't get it.
+  float graze_margin = 0.01f;
   int dropout_min_neighbors = 4;     // see RangeImage::fill_dropouts; 9 turns filling off
   // The robot's dark, glossy covers often return nothing. An empty ray whose path hits the
   // robot's shapes counts as hitting the robot there, so it hides what's behind as shadow

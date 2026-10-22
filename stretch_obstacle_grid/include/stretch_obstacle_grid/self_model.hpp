@@ -43,8 +43,10 @@ public:
 
   // Distance along a ray (unit direction, base_footprint) to the first shape it enters from
   // outside, or infinity. Shapes within 5 cm of containing the origin don't count (the
-  // LiDARs sit in the head). Capsules are treated as their bounding cylinders.
-  float ray_distance(const Eigen::Vector3f & origin, const Eigen::Vector3f & direction) const;
+  // LiDARs sit in the head). Capsules are treated as their bounding cylinders. With padding,
+  // each shape is grown by that much (a box along each of its axes, so a little more at its
+  // edges and corners).
+  float ray_distance(const Eigen::Vector3f & origin, const Eigen::Vector3f & direction, float padding = 0.0f) const;
 
 private:
   // p in the shape's own frame.

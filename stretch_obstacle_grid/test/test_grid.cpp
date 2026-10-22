@@ -460,16 +460,23 @@ TEST(SelfModel, RayDistance)
   EXPECT_NEAR(self.ray_distance(Eigen::Vector3f::Zero(), Eigen::Vector3f::UnitX()), 0.9f, 1e-5);
   EXPECT_TRUE(std::isinf(self.ray_distance(Eigen::Vector3f::Zero(), Eigen::Vector3f::UnitY())));
   EXPECT_TRUE(std::isinf(self.ray_distance(Eigen::Vector3f::Zero(), -Eigen::Vector3f::UnitX())));
+  // A ray passing 5 mm beside the box misses it, unless the shapes are grown by more than that.
+  const Eigen::Vector3f beside(0.0f, 0.105f, 0.0f);
+  EXPECT_TRUE(std::isinf(self.ray_distance(beside, Eigen::Vector3f::UnitX())));
+  EXPECT_NEAR(self.ray_distance(beside, Eigen::Vector3f::UnitX(), 0.01f), 0.89f, 1e-5);
 }
 
 TEST(ObstacleGrid, StaticSelfMatchesPerFrameSelf)
 {
   Scene scene;
   scene.wall_radius = 1.5f;
-  const auto per_frame = label_scene(scene);
+  // Only moving parts get the grazing margin, so the two match without it.
+  ObstacleGridParams params;
+  params.graze_margin = 0.0f;
+  const auto per_frame = label_scene(scene, params);
 
   // The same arm, given once as a static part, with nothing passed per frame.
-  ObstacleGrid og(scene_config(), {scene.lidar()});
+  ObstacleGrid og(scene_config(), {scene.lidar()}, params);
   og.set_static_self(scene.self());
   std::vector<float> xyz;
   std::vector<uint16_t> ring;
@@ -605,6 +612,51 @@ TEST(ObstacleGrid, ReturnBehindRobotIsAGhost)
   }
   EXPECT_EQ(occupied, 0);
   EXPECT_EQ(label_at(og, 0.8f, 0.0f, 0.8f), kShadow);  // still the arm's shadow
+}
+
+TEST(ObstacleGrid, ReturnsGrazingTheRobotsEdgeAreTheRobots)
+{
+  // The robot's real arm is 5 mm wider on each side than its shape. Beams that hit the shape
+  // return nothing (a dark cover), and beams that clip the 5 mm the shape misses come back
+  // from 0.3 m behind the arm (a mixed return off the edge), as off the gripper fingers'
+  // white band (2026-10-22). With no neighboring return for the veil filter, only the
+  // grazing margin tells them from obstacles.
+  Scene scene;
+  std::vector<float> xyz;
+  std::vector<uint16_t> ring;
+  scene.cast(&xyz, &ring);
+  Scene modeled = scene;
+  modeled.arm.min().y() += 0.005f;
+  modeled.arm.max().y() -= 0.005f;
+  const SelfModel self = modeled.self();
+  const Eigen::Vector3f origin(0.0f, 0.0f, Scene::kHeight);
+  std::vector<Eigen::Vector3f> mixed;
+  for (size_t i = 0; i < ring.size(); ++i) {
+    Eigen::Vector3f p(xyz[3 * i], xyz[3 * i + 1], xyz[3 * i + 2]);
+    const Eigen::Vector3f direction = p.normalized();
+    if (Scene::hit_box(origin, direction, modeled.arm)) {
+      xyz[3 * i] = xyz[3 * i + 1] = xyz[3 * i + 2] = std::numeric_limits<float>::quiet_NaN();
+    } else if (auto t = Scene::hit_box(origin, direction, scene.arm)) {
+      p = direction * (*t + 0.3f);
+      xyz[3 * i] = p.x(); xyz[3 * i + 1] = p.y(); xyz[3 * i + 2] = p.z();
+      mixed.push_back(p + origin);
+    }
+  }
+  ASSERT_GT(mixed.size(), 20u);
+  auto occupied_mixed = [&](float graze_margin) {
+      ObstacleGridParams params;
+      params.graze_margin = graze_margin;
+      ObstacleGrid og(scene_config(), {scene.lidar()}, params);
+      og.add_frame(0, xyz.data(), ring.data(), ring.size(), 0.0, self);
+      og.update(self);
+      int occupied = 0;
+      for (const auto & m : mixed) {
+        occupied += label_at(og, m.x(), m.y(), m.z()) == kOccupied;
+      }
+      return occupied;
+    };
+  EXPECT_EQ(occupied_mixed(0.01f), 0);
+  EXPECT_GT(occupied_mixed(0.0f), 0);  // they'd be obstacles without it
 }
 
 TEST(ObstacleGrid, VeilBeamsAreFreeUpToTheEdge)

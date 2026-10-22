@@ -149,14 +149,15 @@ PYBIND11_MODULE(stretch_obstacle_grid, m)
     }, py::arg("point"), py::arg("padding") = 0.0f)
   .def("__len__", [](const SelfModel & s) {return s.shapes().size();})
   .def("shapes", &SelfModel::shapes, "A copy of the shapes.")
-  .def("ray_distance", &SelfModel::ray_distance, py::arg("origin"), py::arg("direction"),
-    "Distance along a ray (unit direction) to the first shape it enters from outside, or inf.");
+  .def("ray_distance", &SelfModel::ray_distance, py::arg("origin"), py::arg("direction"), py::arg("padding") = 0.0f,
+    "Distance along a ray (unit direction) to the first shape (grown by padding) it enters from outside, or inf.");
 
   py::class_<ObstacleGridParams>(m, "ObstacleGridParams")
   .def(py::init<>())
   .def_readwrite("self_point_padding", &ObstacleGridParams::self_point_padding)
   .def_readwrite("self_voxel_padding", &ObstacleGridParams::self_voxel_padding)
   .def_readwrite("range_margin", &ObstacleGridParams::range_margin)
+  .def_readwrite("graze_margin", &ObstacleGridParams::graze_margin)
   .def_readwrite("dropout_min_neighbors", &ObstacleGridParams::dropout_min_neighbors)
   .def_readwrite("empty_rays_hit_self", &ObstacleGridParams::empty_rays_hit_self)
   .def_readwrite("contamination_reach", &ObstacleGridParams::contamination_reach)

@@ -117,11 +117,12 @@ void ObstacleGrid::add_frame(
       what = Hit::kSelf;
     } else {
       // A return from behind the robot along its own beam is a multipath ghost (the beam
-      // bounced off the shiny gripper and came back late): the beam really ended on the robot.
+      // bounced off the shiny gripper and came back late), or a mixed return off a moving
+      // part's edge it grazed (graze_margin): the beam really ended on the robot.
       const Eigen::Vector3f direction = base_from_lidar.linear() * point(i) / range;
       const float robot = std::min(
         static_self_.ray_distance(base_from_lidar.translation(), direction),
-        self.ray_distance(base_from_lidar.translation(), direction));
+        self.ray_distance(base_from_lidar.translation(), direction, params_.graze_margin));
       if (robot < range - params_.range_margin) {
         what = Hit::kSelf;
         range = robot;

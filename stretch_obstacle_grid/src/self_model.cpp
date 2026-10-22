@@ -91,7 +91,7 @@ void slab_interval(float o, float d, float half, float * lo, float * hi)
 }
 }  // namespace
 
-float SelfModel::ray_distance(const Eigen::Vector3f & origin, const Eigen::Vector3f & direction) const
+float SelfModel::ray_distance(const Eigen::Vector3f & origin, const Eigen::Vector3f & direction, float padding) const
 {
   // Most rays miss the robot entirely: check the bounds of all its shapes first.
   if (shapes_.empty()) {
@@ -99,7 +99,7 @@ float SelfModel::ray_distance(const Eigen::Vector3f & origin, const Eigen::Vecto
   }
   float lo_all = 0.0f, hi_all = kInf;
   for (int axis = 0; axis < 3; ++axis) {
-    const float half = 0.5f * (all_bounds_.max()[axis] - all_bounds_.min()[axis]);
+    const float half = 0.5f * (all_bounds_.max()[axis] - all_bounds_.min()[axis]) + padding;
     const float center = 0.5f * (all_bounds_.max()[axis] + all_bounds_.min()[axis]);
     float a, b;
     slab_interval(origin[axis] - center, direction[axis], half, &a, &b);
@@ -124,17 +124,18 @@ float SelfModel::ray_distance(const Eigen::Vector3f & origin, const Eigen::Vecto
     switch (shape.type) {
       case SelfShape::Type::kBox:
         for (int axis = 0; axis < 3; ++axis) {
-          slab_interval(o[axis], d[axis], shape.dims[axis], &a, &b);
+          slab_interval(o[axis], d[axis], shape.dims[axis] + padding, &a, &b);
           lo = std::max(lo, a);
           hi = std::min(hi, b);
         }
         break;
       case SelfShape::Type::kCylinder:
       case SelfShape::Type::kCapsule: {
-        const float half = shape.dims.y() + (shape.type == SelfShape::Type::kCapsule ? shape.dims.x() : 0.0f);
+        const float half = shape.dims.y() + (shape.type == SelfShape::Type::kCapsule ? shape.dims.x() : 0.0f) + padding;
         slab_interval(o.z(), d.z(), half, &lo, &hi);
         const float c = d.x() * d.x() + d.y() * d.y();
-        const float a0 = o.x() * o.x() + o.y() * o.y() - shape.dims.x() * shape.dims.x();
+        const float radius = shape.dims.x() + padding;
+        const float a0 = o.x() * o.x() + o.y() * o.y() - radius * radius;
         if (c < 1e-12f) {
           if (a0 > 0.0f) {hi = -kInf;}  // parallel to the axis and outside it
         } else {
@@ -145,7 +146,8 @@ float SelfModel::ray_distance(const Eigen::Vector3f & origin, const Eigen::Vecto
         break;
       }
       case SelfShape::Type::kSphere:
-        quadratic_interval(o.squaredNorm() - shape.dims.x() * shape.dims.x(), 2.0f * o.dot(d), 1.0f, &lo, &hi);
+        quadratic_interval(o.squaredNorm() - (shape.dims.x() + padding) * (shape.dims.x() + padding), 2.0f * o.dot(d), 1.0f,
+          &lo, &hi);
         break;
     }
     if (lo <= hi && lo > 0.0f) {
