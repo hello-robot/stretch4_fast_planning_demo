@@ -15,6 +15,9 @@ Outputs:
   obstacle_grid/{occupied,static,shadow,contaminated} with publish_labels, as grid_viz_node.py
       does, and obstacle_grid/robot_shapes (MarkerArray): the shapes the grid takes as the robot
       (for RViz; costs a few ms per frame)
+  obstacle_grid/check_markers (MarkerArray, 10 Hz) with publish_checks: each check's path,
+      what limits it and the voxels behind a block, and the trajectory server's plan (from
+      dynamic_trajectory_server_diagnostics/plan); see check_viz.py
 
 Every frame from either LiDAR (each sweeps at 10 Hz, about 35 ms apart) goes into the grid as
 it arrives. The labels and tables are rebuilt after every frame, or with
@@ -35,6 +38,8 @@ Parameters:
   threads (0): OpenMP threads for the grid's parallel loops, 0 for every core. Idle threads
       sleep (OMP_WAIT_POLICY=passive), so they don't take CPU from the drivers between loops.
   publish_labels (false), report_period (5.0)
+  publish_checks (true): see Outputs. fade_time (3.0): s a block's leftovers take to fade
+      once checks stop showing it. plan_fade_time (10.0): likewise for a replaced plan.
   ring_elevations_file (""): a LiDAR calibration CSV (Elevation column, deg, one row per ring)
       to take ring elevations from instead of measuring them from the first frames. For the
       MuJoCo sim, whose upward rings return nothing in an open room:
@@ -62,12 +67,14 @@ from nav_msgs.msg import Odometry
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup, ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
-from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
+from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 from rclpy.time import Time
 from sensor_msgs.msg import JointState, PointCloud2
-from std_msgs.msg import ColorRGBA, Header
-from visualization_msgs.msg import Marker, MarkerArray
+from std_msgs.msg import Header
+from trajectory_msgs.msg import JointTrajectory
+from visualization_msgs.msg import MarkerArray
 
+import check_viz
 import stretch_obstacle_grid as og
 from grid_setup import (GRID_FRAME, LIDARS, RobotShapes, cloud_fields, joint_vector, load_calibration,
                         load_ring_elevations, make_grid, odom_pose, step_braking, transform_matrix)
@@ -84,38 +91,6 @@ ADD_FRAME_STEPS = ("bin_points", "nearest", "clusters", "classify", "veil", "emp
 
 def stamp_seconds(stamp):
     return stamp.sec + stamp.nanosec * 1e-9
-
-
-def shape_markers(header, shapes):
-    """The grid's robot shapes as translucent markers."""
-    markers = MarkerArray()
-    kinds = {"box": Marker.CUBE, "cylinder": Marker.CYLINDER, "capsule": Marker.CYLINDER, "sphere": Marker.SPHERE}
-    for i, shape in enumerate(shapes):
-        pose = np.asarray(shape.pose, dtype=float)
-        d = np.asarray(shape.dims, dtype=float)
-        m = Marker(header=header, ns="robot_shapes", id=i, type=kinds[shape.kind], action=Marker.ADD,
-                   color=ColorRGBA(r=0.2, g=0.6, b=1.0, a=0.35))
-        m.pose.position.x, m.pose.position.y, m.pose.position.z = (float(v) for v in pose[:3, 3])
-        q = rotation_to_quaternion(pose[:3, :3])
-        m.pose.orientation.x, m.pose.orientation.y, m.pose.orientation.z, m.pose.orientation.w = q
-        if shape.kind == "box":
-            m.scale.x, m.scale.y, m.scale.z = (float(v) for v in 2 * d)
-        elif shape.kind == "sphere":
-            m.scale.x = m.scale.y = m.scale.z = float(2 * d[0])
-        else:  # cylinder; a capsule as its bounding cylinder
-            m.scale.x = m.scale.y = float(2 * d[0])
-            m.scale.z = float(2 * d[1] + (2 * d[0] if shape.kind == "capsule" else 0.0))
-        markers.markers.append(m)
-    return markers
-
-
-def rotation_to_quaternion(r):
-    """(x, y, z, w) of a rotation matrix."""
-    w = np.sqrt(max(0.0, 1.0 + r[0, 0] + r[1, 1] + r[2, 2])) / 2
-    x = np.copysign(np.sqrt(max(0.0, 1.0 + r[0, 0] - r[1, 1] - r[2, 2])) / 2, r[2, 1] - r[1, 2])
-    y = np.copysign(np.sqrt(max(0.0, 1.0 - r[0, 0] + r[1, 1] - r[2, 2])) / 2, r[0, 2] - r[2, 0])
-    z = np.copysign(np.sqrt(max(0.0, 1.0 - r[0, 0] - r[1, 1] + r[2, 2])) / 2, r[1, 0] - r[0, 1])
-    return float(x), float(y), float(z), float(w)
 
 
 class Stats:
@@ -156,6 +131,9 @@ class ObstacleMonitor(Node):
         self.update_every_frame = self.declare_parameter("update_every_frame", True).value
         self.stale_after = self.declare_parameter("stale_after", 0.5).value
         self.publish_labels = self.declare_parameter("publish_labels", False).value
+        self.publish_checks = self.declare_parameter("publish_checks", True).value
+        self.fade_time = self.declare_parameter("fade_time", 3.0).value
+        self.plan_fade_time = self.declare_parameter("plan_fade_time", 10.0).value
         report_period = self.declare_parameter("report_period", 5.0).value
         calibration_file = self.declare_parameter("calibration_file", "").value
         ring_file = self.declare_parameter("ring_elevations_file", "").value
@@ -171,6 +149,7 @@ class ObstacleMonitor(Node):
         # thread and the check_motion thread each have their own.
         self.robot = RobotShapes()
         self.planned_robot = RobotShapes()
+        self.viz_robot = RobotShapes()  # for drawing plans, on the viz thread
         resolution = self.robot.config["planner"]["check_resolution"]
         self.resolution = np.array([resolution[name] for name in JOINT_NAMES])
         self.names = self.robot.shape_names()
@@ -203,6 +182,17 @@ class ObstacleMonitor(Node):
         self.label_pubs = {name: self.create_publisher(PointCloud2, f"obstacle_grid/{name}", 1)
                            for name in DEBUG_LABELS} if self.publish_labels else {}
         self.shapes_pub = self.create_publisher(MarkerArray, "obstacle_grid/robot_shapes", 1) if self.publish_labels else None
+        # Checks queue what to draw; the viz thread draws it (and plans) at 10 Hz, so checks
+        # answer without waiting on markers.
+        self.display = None  # check_viz.CheckDisplay, once the grid is up
+        self.drawn_checks = collections.deque(maxlen=20)
+        if self.publish_checks:
+            viz = MutuallyExclusiveCallbackGroup()
+            self.check_markers_pub = self.create_publisher(MarkerArray, "obstacle_grid/check_markers", 1)
+            self.create_subscription(JointTrajectory, "dynamic_trajectory_server_diagnostics/plan", self.on_plan,
+                                     QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL),
+                                     callback_group=viz)
+            self.create_timer(0.1, self.draw_checks, callback_group=viz)
         self.static_shapes = self.robot.static_model().shapes()
         self.create_timer(report_period, self.report, callback_group=sensors)
         self.get_logger().info("Waiting for a frame from each LiDAR and their mounts in TF...")
@@ -270,7 +260,7 @@ class ObstacleMonitor(Node):
             header = Header(stamp=msg.header.stamp, frame_id=GRID_FRAME)
             for name, publisher in self.label_pubs.items():
                 publisher.publish(xyz_cloud(header, self.centers[labels == int(PUBLISHED_LABELS[name])]))
-            self.shapes_pub.publish(shape_markers(header, self.static_shapes + moving.shapes()))
+            self.shapes_pub.publish(MarkerArray(markers=check_viz.shape_markers(header, self.static_shapes + moving.shapes())))
 
     def set_up(self, topic, msg):
         """Build the grid once there's a frame from every LiDAR and TF has their mounts."""
@@ -287,7 +277,10 @@ class ObstacleMonitor(Node):
                             overrides={"static_after": self.static_after, "threads": self.threads,
                                        **({"table_threads": self.threads} if self.threads else {})},
                             ring_elevations_table=self.ring_elevations, azimuth_bins=self.azimuth_bins)
-        self.centers = grid.grid.centers() if self.publish_labels else None
+        self.centers = grid.grid.centers() if self.publish_labels or self.publish_checks else None
+        if self.publish_checks:
+            self.display = check_viz.CheckDisplay(check_viz.mean_voxel_size(grid.grid), self.fade_time,
+                                                  self.plan_fade_time)
         self.grid = grid
         self.get_logger().info(f"Grid ready ({grid.grid.size:,} voxels); serving check_motion")
 
@@ -323,13 +316,18 @@ class ObstacleMonitor(Node):
                     q[j] = point.positions[index[name]]
             configurations.append(q)
 
-        # Steps of at most the planner's check resolution, each tagged with its segment.
-        samples, segment_of_step = [configurations[0]], []
+        # Steps of at most the planner's check resolution, each tagged with its segment, with
+        # its planned start time and duration.
+        samples, segment_of_step, step_starts, step_durations = [configurations[0]], [], [], []
+        times = [stamp_seconds(p.time_from_start) for p in points]
         for segment, (a, b) in enumerate(zip(configurations[:-1], configurations[1:])):
             n = max(1, int(np.ceil(np.max(np.abs(b - a) / self.resolution))))
+            duration = (times[segment + 1] - times[segment]) / n
             for k in range(1, n + 1):
                 samples.append(a + (b - a) * (k / n))
                 segment_of_step.append(segment)
+                step_starts.append(times[segment] + (k - 1) * duration)
+                step_durations.append(duration)
         bodies = [self.planned_robot.planning_body(q) for q in samples]
         braking = step_braking(samples)
         posed = time.perf_counter()
@@ -343,7 +341,12 @@ class ObstacleMonitor(Node):
                 return response
             theta_slack = abs(self.heading_at(self.now()) - self.heading_at(oldest))
             steps = self.checker.check(self.grid, bodies, age, theta_slack, braking)
-        checked = time.perf_counter()
+            checked = time.perf_counter()
+            # The voxels behind a block (or unsafe space) have to come from this grid, before
+            # the next update relabels it.
+            drawn = self.check_to_draw(bodies, steps, step_starts, step_durations, theta_slack) \
+                if self.display is not None else None
+        hits_done = time.perf_counter()
 
         n_segments = len(points) - 1
         min_duration = np.zeros(n_segments)
@@ -381,7 +384,69 @@ class ObstacleMonitor(Node):
         response.grid_age = float(age)
         self.stats.add(check_posing=posed - start, check_grid=checked - posed,
                        check_total=time.perf_counter() - start, check_grid_age=age)
+        if drawn is not None:
+            self.stats.add(check_hits=hits_done - checked)
+            self.drawn_checks.append(drawn)
         return response
+
+    # --- check markers -----------------------------------------------------------------------
+
+    def check_to_draw(self, bodies, steps, step_starts, step_durations, theta_slack):
+        """What draw_checks needs about a check, with the voxels behind its focus (call with
+        the grid locked)."""
+        statuses = check_viz.step_statuses(steps, step_durations)
+        focus = check_viz.choose_focus(statuses, steps, step_durations)
+        hits, seen_by, labels = [], None, None
+        if focus is not None and focus[1] in (check_viz.BLOCKED, check_viz.UNSAFE):
+            kind = og.HitKind.OBSTACLES if focus[1] == check_viz.BLOCKED else og.HitKind.UNSAFE
+            hits = self.checker.step_hits(self.grid, bodies, focus[0], kind, theta_slack)
+            voxels = [h.voxel for h in hits]
+            seen_by = self.grid.seen_by(voxels)
+            labels = self.grid.labels()[np.array(voxels, dtype=np.int64)]
+        now = self.now()
+        return dict(stamp=now, heading=self.heading_at(now), bodies=bodies, steps=steps, statuses=statuses,
+                    focus=focus, starts=step_starts, durations=step_durations, hits=hits, seen_by=seen_by,
+                    labels=labels)
+
+    def draw_checks(self):
+        if self.display is None:
+            return
+        start = time.perf_counter()
+        lidar_names = [t.rsplit("_", 1)[-1] for t in self.topics]
+        while self.drawn_checks:
+            c = self.drawn_checks.popleft()
+            wrist, tip = check_viz.path_points(c["bodies"], self.names)
+            focus = None
+            if c["focus"] is not None:
+                k, status = c["focus"]
+                focus = check_viz.make_focus(k, status, c["bodies"], self.names, c["steps"], c["durations"],
+                                             c["starts"], c["hits"], c["seen_by"], c["labels"], self.centers,
+                                             lidar_names)
+            self.display.add_check(check_viz.CheckRecord(c["stamp"], c["heading"], wrist, tip, c["statuses"], focus))
+        now = self.now()
+        header = Header(frame_id=GRID_FRAME)  # stamp 0: the latest transform
+        self.check_markers_pub.publish(MarkerArray(markers=self.display.markers(header, now, self.heading_at(now))))
+        self.stats.add(check_markers=time.perf_counter() - start)
+
+    def on_plan(self, msg):
+        """Draw the trajectory server's plan: its points as planner configurations, filling in
+        joints it leaves out from the joint state now; base rotation from its stamp's heading."""
+        if self.display is None or self.joint_state is None or not msg.points:
+            return
+        q_now = joint_vector(self.joint_state)
+        self.viz_robot.set_fingers(self.joint_state)
+        index = {name: i for i, name in enumerate(msg.joint_names)}
+        bodies = []
+        for point in msg.points:
+            q = q_now.copy()
+            q[0] = 0.0  # base rotation is relative to the heading at the stamp
+            for j, name in enumerate(JOINT_NAMES):
+                if name in index:
+                    q[j] = point.positions[index[name]]
+            bodies.append(self.viz_robot.planning_body(q))
+        wrist, tip = check_viz.path_points(bodies, self.names)
+        heading = self.heading_at(stamp_seconds(msg.header.stamp))
+        self.display.add_plan(check_viz.PlanRecord(heading, wrist, tip, bodies[-1].shapes()), self.now())
 
     # --- reporting ----------------------------------------------------------------------------
 

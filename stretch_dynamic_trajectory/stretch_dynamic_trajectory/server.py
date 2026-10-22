@@ -16,7 +16,10 @@ the block as usual, and goes back to full speed once resume_clear_checks checks 
 nothing blocked and resume_delay s have passed. The scale never rises faster than
 max_scale_up_rate. Each check's details (which
 segment and shape limit the motion, clearances, blocked segments) are published on
-dynamic_trajectory_server_diagnostics/check. Joints are commanded in velocity mode, like
+dynamic_trajectory_server_diagnostics/check, and the path being followed on
+dynamic_trajectory_server_diagnostics/plan (JointTrajectory, latched) every time it changes:
+for now once per goal, and later on every replan. Its stamp is when its base rotation is
+measured from (the base's heading then is 0). The obstacle monitor draws it in RViz. Joints are commanded in velocity mode, like
 the default server's adaptive_velocity mode: the scaled planned velocity plus kp times the
 position error, with the joint's maximum acceleration so the firmware follows each command.
 
@@ -38,6 +41,7 @@ from control_msgs.action import FollowJointTrajectory
 from diagnostic_msgs.msg import DiagnosticArray, DiagnosticStatus, KeyValue
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
 from rclpy.parameter import Parameter
+from rclpy.qos import DurabilityPolicy, QoSProfile
 from sensor_msgs.msg import JointState
 from std_msgs.msg import Header
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
@@ -57,7 +61,9 @@ CREEP_LEVERS = {"mobile_base_rotation_joint": 1.0, **{j: 0.3 for j in WRIST_JOIN
 
 
 def duration_msg(seconds):
-    return DurationMsg(sec=int(seconds // 1), nanosec=int(round((seconds % 1) * 1e9)) % 1000000000)
+    # Round to whole nanoseconds first: rounding only the fraction turns 0.9999999999 s into 0 s.
+    sec, nanosec = divmod(int(round(seconds * 1e9)), 1000000000)
+    return DurationMsg(sec=sec, nanosec=nanosec)
 
 
 class DynamicTrajectoryActionServer(StretchTrajectoryActionServer):
@@ -76,6 +82,9 @@ class DynamicTrajectoryActionServer(StretchTrajectoryActionServer):
                                                   callback_group=MutuallyExclusiveCallbackGroup())
         self._pub_timing = driver.create_publisher(JointState, "dynamic_trajectory_server_diagnostics/timing", 10)
         self._pub_check = driver.create_publisher(DiagnosticArray, "dynamic_trajectory_server_diagnostics/check", 10)
+        self._pub_plan = driver.create_publisher(
+            JointTrajectory, "dynamic_trajectory_server_diagnostics/plan",
+            QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL))
 
     def declare_params(self):
         super().declare_params()
@@ -176,6 +185,7 @@ class DynamicTrajectoryActionServer(StretchTrajectoryActionServer):
             self.direct_command_preempted = False
             self.preempted_joints = set()
             plan = self._plan(trajectory)
+            self._publish_plan(plan, joints)
             with self._check_lock:
                 self._check = None
             self._state = (0.0, self._positions(joints))
@@ -211,6 +221,16 @@ class DynamicTrajectoryActionServer(StretchTrajectoryActionServer):
         else:
             positions[0] = list(now)  # start from where the robot is
         return Trajectory(times, positions, velocities)
+
+    def _publish_plan(self, plan, joints, step=0.05, max_points=400):
+        """The path being followed, sampled every `step` s of trajectory time (the waypoints
+        alone would miss the curves between them), stamped with when the base's rotation in it
+        is measured from."""
+        times = np.linspace(0.0, plan.duration, int(np.clip(np.ceil(plan.duration / step), 1, max_points - 1)) + 1)
+        msg = JointTrajectory(header=Header(stamp=self.driver.get_clock().now().to_msg()), joint_names=joints)
+        msg.points = [JointTrajectoryPoint(positions=[float(v) for v in plan.sample(t)[0]], time_from_start=duration_msg(t))
+                      for t in times]
+        self._pub_plan.publish(msg)
 
     def _positions(self, joints):
         return np.array([self._joint_position(j) for j in joints], dtype=float)
