@@ -3,8 +3,9 @@
 import numpy as np
 import pytest
 
-from stretch_dynamic_trajectory.timing import (CheckResult, ResumeGate, Trajectory, scale_deceleration, segment_caps,
-                                               step_scale, stopping_for_block, target_scale)
+from stretch_dynamic_trajectory.timing import (CheckResult, ResumeGate, Trajectory, blocked_anywhere, creep_scale,
+                                               scale_deceleration, segment_caps, step_scale, stopping_for_block,
+                                               target_scale)
 
 
 def line(duration=2.0, distance=0.3):
@@ -63,10 +64,12 @@ def test_target_scale_stops_by_the_end_of_what_was_checked():
     assert target_scale(0.0, None, 2.0, trajectory_end=2.0) == 0.0
 
 
-def simulate(trajectory, cap_at, a, dt=0.02, seconds=6.0, horizon=1.0, step=0.1, gate=None, up_rate=None):
+def simulate(trajectory, cap_at, a, dt=0.02, seconds=6.0, horizon=1.0, step=0.1, gate=None, up_rate=None,
+             creep=(0.02, [1.0])):
     """Run the scale and tau forward with checks every 0.1 s, as the server does; cap_at(t, tau)
     gives the cap at trajectory time tau at wall time t, and a segment gets the tightest cap
-    anywhere in it (as a real check sweeps the whole segment). Returns arrays of (t, tau, scale)."""
+    anywhere in it (as a real check sweeps the whole segment). creep: (speed, levers) while the
+    gate lets the robot creep. Returns arrays of (t, tau, scale)."""
     tau, scale, rows, result = 0.0, 0.0, [], None
     for k in range(int(seconds / dt)):
         t = k * dt
@@ -81,9 +84,11 @@ def simulate(trajectory, cap_at, a, dt=0.02, seconds=6.0, horizon=1.0, step=0.1,
         target = target_scale(tau, result, a, trajectory.duration)
         if gate is not None:
             if fresh:
-                gate.update(t, stopping_for_block(result, target))
-            if gate.held:
+                gate.update(t, stopping_for_block(result, target), blocked_anywhere(result))
+            if gate.state == ResumeGate.STOPPED:
                 target = 0.0
+            elif gate.state == ResumeGate.CREEPING:
+                target = min(target, creep_scale(trajectory, tau, min(trajectory.duration, tau + horizon), *creep))
         scale = step_scale(scale, target, a, dt, up_rate=up_rate)
         tau = min(trajectory.duration, tau + scale * dt)
         rows.append((t, tau, scale))
@@ -130,15 +135,43 @@ def test_speeding_up_is_limited_separately_from_slowing_down():
 
 def test_resume_gate_needs_several_clear_checks_and_some_time():
     gate = ResumeGate(clear_checks=3, delay=0.5)
-    assert not gate.update(0.0, blocking=False)  # never held without a block
-    assert gate.update(0.1, blocking=True)
-    assert gate.update(0.2, blocking=False)  # one clear check between blocked ones isn't enough
-    assert gate.update(0.3, blocking=True)
-    assert gate.update(0.4, blocking=False)
-    assert gate.update(0.5, blocking=False)
-    assert gate.update(0.6, blocking=False)  # three in a row, but only 0.3 s since the block
-    assert gate.update(0.7, blocking=False)
-    assert not gate.update(0.8, blocking=False)  # 0.5 s: go
+    FREE, STOPPED = ResumeGate.FREE, ResumeGate.STOPPED
+    assert gate.update(0.0, stopping=False, blocked=True) == FREE  # never held without a stop
+    assert gate.update(0.1, stopping=True, blocked=True) == STOPPED
+    assert gate.update(0.2, stopping=False, blocked=False) == STOPPED  # one clear check isn't enough
+    assert gate.update(0.3, stopping=True, blocked=True) == STOPPED
+    assert gate.update(0.4, stopping=False, blocked=False) == STOPPED
+    assert gate.update(0.5, stopping=False, blocked=False) == STOPPED
+    # Three in a row, but only 0.3 s since the last block: 0.5 s since the stop, so creep.
+    assert gate.update(0.6, stopping=False, blocked=False) == ResumeGate.CREEPING
+    assert gate.update(0.7, stopping=False, blocked=False) == ResumeGate.CREEPING
+    assert gate.update(0.8, stopping=False, blocked=False) == FREE  # 0.5 s: go
+    assert not gate.held
+
+
+def test_resume_gate_creeps_while_a_block_remains_ahead():
+    gate = ResumeGate(clear_checks=3, delay=0.5)
+    STOPPED, CREEPING, FREE = ResumeGate.STOPPED, ResumeGate.CREEPING, ResumeGate.FREE
+    assert gate.update(0.1, stopping=True, blocked=True) == STOPPED
+    for t in (0.2, 0.3, 0.4, 0.5):  # stopped a while, whether the block is right ahead or not
+        assert gate.update(t, stopping=t == 0.3, blocked=True) == STOPPED
+    assert gate.update(0.6, stopping=False, blocked=True) == CREEPING  # 0.5 s since the stop
+    # Crept up to it: the check itself stops the robot; it stays free to creep when there's room.
+    assert gate.update(0.7, stopping=True, blocked=True) == CREEPING
+    assert gate.update(1.2, stopping=False, blocked=True) == CREEPING
+    for t in (1.3, 1.4, 1.5):  # three clear checks, but only 0.3 s since the last block
+        assert gate.update(t, stopping=False, blocked=False) == CREEPING
+    assert gate.update(1.6, stopping=False, blocked=True) == CREEPING  # and a block again: start over
+    for t in (1.7, 1.8, 1.9, 2.0):
+        assert gate.update(t, stopping=False, blocked=False) == CREEPING
+    assert gate.update(2.1, stopping=False, blocked=False) == FREE
+
+
+def test_creep_scale_bounds_the_fastest_point():
+    # An arm at 0.1 m/s and a wrist at 0.5 rad/s with a 0.3 m lever: up to 0.25 m/s at the tip.
+    trajectory = Trajectory([0.0, 1.0], [[0.0, 0.0], [0.1, 0.5]], velocities=[[0.1, 0.5], [0.1, 0.5]])
+    assert creep_scale(trajectory, 0.0, 1.0, 0.02, [1.0, 0.3]) == pytest.approx(0.02 / 0.25)
+    assert creep_scale(trajectory, 0.0, 1.0, 0.5, [1.0, 0.3]) == 1.0  # already slower than that
 
 
 def test_stopping_for_block_only_when_stopping_now():
@@ -164,7 +197,35 @@ def test_a_flickering_block_holds_the_robot_instead_of_restarting_it():
 
     t, tau, scale = simulate(trajectory, cap_at, a, seconds=8.0, gate=ResumeGate(3, 0.5), up_rate=2.0).T
     stopped = (t > 1.9) & (t < 4.0)
-    assert scale[stopped].max() == pytest.approx(0.0, abs=1e-9)  # held through the flicker
-    assert tau[t < 4.0].max() <= 1.2 + 1e-6
+    # Held through the flicker: at most a creep while a clear check lasts, a few mm into what
+    # the checks before called blocked.
+    assert scale[stopped].max() <= creep_scale(trajectory, 0.0, 4.0, 0.02, [1.0]) + 1e-9
+    position = np.array([trajectory.sample(u)[0][0] for u in tau])
+    assert position[t < 4.0].max() - trajectory.sample(1.2)[0][0] < 0.005
     assert tau[-1] == pytest.approx(4.0)  # then finished once it stayed clear
     assert np.max(np.diff(scale)) <= 2.0 * 0.02 + 1e-9  # and sped up gently
+
+
+def test_after_a_stop_the_robot_creeps_up_to_a_block_and_stops_short_of_it():
+    # As on the robot (2026-10-22, a hand in front of the arm): the checks first see the block
+    # right ahead and stop the robot, then see it a few cm further on, on and off. The robot
+    # should creep up to it at the creep speed, not restart at full speed, and stop before it.
+    trajectory = line(duration=4.0, distance=0.2)  # 0.05 m/s on average, up to 0.075
+    a = scale_deceleration(trajectory, 0.0, 4.0, [0.7], max_rate=5.0)
+
+    def cap_at(t, tau):
+        if t < 1.0 or t >= 6.0:
+            return 1.0
+        near = t < 1.3 or round(t * 10) % 3 == 0  # seen right ahead now and then
+        return 0.0 if tau >= (1.1 if near else 1.6) else 1.0
+
+    t, tau, scale = simulate(trajectory, cap_at, a, seconds=10.0, gate=ResumeGate(3, 0.5), up_rate=2.0).T
+    stopped_at = t[(t > 1.0) & (scale == 0.0)][0]
+    position = np.array([trajectory.sample(u)[0][0] for u in tau])
+    speed = np.abs(np.diff(position)) / np.diff(t)
+    after_stop = (t[1:] > stopped_at) & (t[1:] < 6.0)
+    assert speed[after_stop].max() <= 0.02 + 1e-6  # crept at 2 cm/s, never more
+    assert speed[after_stop].max() > 0.01  # but did creep
+    assert tau[t < 6.0].max() <= 1.6 + 1e-6  # and never into the block
+    assert tau[(t > 5.5) & (t < 6.0)].min() > 1.4  # but got close to it
+    assert tau[-1] == pytest.approx(4.0)  # then finished once it stayed clear

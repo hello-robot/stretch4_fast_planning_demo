@@ -10,8 +10,11 @@ check_horizon seconds of the trajectory, about check_rate times a second, and th
 kept low enough to be down to each segment's allowed speed when the robot gets there, to
 stop before a blocked segment, and to stop by the end of what's been checked. Without a fresh
 answer (check_timeout) the robot slows to a stop. Once the checks stop the robot for a blocked
-path, it's held until resume_clear_checks checks in a row let it go and resume_delay s have
-passed, and the scale never rises faster than max_scale_up_rate. Each check's details (which
+path, it stays stopped for resume_delay s, then creeps toward the block at no more than
+creep_speed (at any point of the robot) while the path just ahead is clear, stopping before
+the block as usual, and goes back to full speed once resume_clear_checks checks in a row see
+nothing blocked and resume_delay s have passed. The scale never rises faster than
+max_scale_up_rate. Each check's details (which
 segment and shape limit the motion, clearances, blocked segments) are published on
 dynamic_trajectory_server_diagnostics/check. Joints are commanded in velocity mode, like
 the default server's adaptive_velocity mode: the scaled planned velocity plus kp times the
@@ -42,10 +45,15 @@ from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 from hello_helpers.stretch4_ros_api import StretchTrajectoryActionServer
 from stretch_motion_planning_interfaces.srv import CheckMotion
 
-from stretch_dynamic_trajectory.timing import (CheckResult, ResumeGate, Trajectory, scale_deceleration,
-                                               segment_caps, step_scale, stopping_for_block, target_scale)
+from stretch_dynamic_trajectory.timing import (CheckResult, ResumeGate, Trajectory, blocked_anywhere, creep_scale,
+                                               scale_deceleration, segment_caps, step_scale, stopping_for_block,
+                                               target_scale)
 
 WRIST_JOINTS = ("wrist_yaw_joint", "wrist_pitch_joint", "wrist_roll_joint")
+# m a point of the robot moves per unit of each joint's motion, at most, for bounding the
+# fastest point's speed while creeping: the robot's reach for base rotation (arm out 0.55 m plus
+# the gripper), the gripper's length for the wrist joints, and 1 for everything else.
+CREEP_LEVERS = {"mobile_base_rotation_joint": 1.0, **{j: 0.3 for j in WRIST_JOINTS}}
 
 
 def duration_msg(seconds):
@@ -84,10 +92,13 @@ class DynamicTrajectoryActionServer(StretchTrajectoryActionServer):
         # rises per s (0 to full speed in 0.5 s), so starting and resuming are gentle
         add_param("max_scale_rate", 5.0)
         add_param("max_scale_up_rate", 2.0)
-        # After the checks stop the robot for a blocked path, hold it until this many checks in
-        # a row let it go and this many s have passed since the last blocking one.
+        # After the checks stop the robot for a blocked path, keep it stopped for resume_delay
+        # s, then let it creep toward the block at no more than creep_speed (m/s at any point of
+        # the robot), and back to full speed once resume_clear_checks checks in a row see
+        # nothing blocked and resume_delay s have passed since the last one that did.
         add_param("resume_clear_checks", 3)
         add_param("resume_delay", 0.5)
+        add_param("creep_speed", 0.02)
         # Progress along the path slows as the robot falls behind it, and stops once a joint is
         # this many of its tolerances behind (it can't keep up, or something holds it), so the
         # desired state never runs away from the robot.
@@ -225,6 +236,8 @@ class DynamicTrajectoryActionServer(StretchTrajectoryActionServer):
         max_rate, max_up_rate = self.get_param("max_scale_rate"), self.get_param("max_scale_up_rate")
         gate = ResumeGate(self.get_param("resume_clear_checks"), self.get_param("resume_delay"))
         gated_stamp = None  # the last check counted by the gate
+        creep_speed = self.get_param("creep_speed")
+        levers = np.array([CREEP_LEVERS.get(j, 1.0) for j in joints])
         check_timeout = self.get_param("check_timeout")
         max_lag = self.get_param("max_lag_tolerances")
         catch_up_fraction, catch_up_floor = self.get_param("catch_up_fraction"), self.get_param("catch_up_floor")
@@ -244,14 +257,16 @@ class DynamicTrajectoryActionServer(StretchTrajectoryActionServer):
                 check = self._check
             if check is not None and now - check.stamp > check_timeout:
                 check = None  # stale: slow to a stop
-            rate_limit = scale_deceleration(plan, tau, min(plan.duration, tau + self.get_param("check_horizon")),
-                                            max_acceleration, max_rate)
+            horizon_end = min(plan.duration, tau + self.get_param("check_horizon"))
+            rate_limit = scale_deceleration(plan, tau, horizon_end, max_acceleration, max_rate)
             target = target_scale(tau, check, rate_limit, plan.duration)
             if check is not None and check.stamp != gated_stamp:
                 gated_stamp = check.stamp
-                gate.update(check.stamp, stopping_for_block(check, target))
-            if gate.held:
+                gate.update(check.stamp, stopping_for_block(check, target), blocked_anywhere(check))
+            if gate.state == ResumeGate.STOPPED:
                 target = 0.0
+            elif gate.state == ResumeGate.CREEPING:
+                target = min(target, creep_scale(plan, tau, horizon_end, creep_speed, levers))
             scale = step_scale(scale, target, rate_limit, dt, up_rate=max_up_rate)
 
             # Advance along the plan more slowly the further the robot lags behind it, and not
@@ -284,7 +299,7 @@ class DynamicTrajectoryActionServer(StretchTrajectoryActionServer):
                         self.driver.check_and_set_vel(joint, float(commands[i]), a=float(max_acceleration[i])
                                                       if np.isfinite(max_acceleration[i]) else None)
             self._publish(goal_handle, joints, tau, scale, target, check, now, desired, actual, commands, start,
-                          gate.held)
+                          gate.state)
             rate.sleep()
 
         # At the end of the path: settle on the last waypoint as the default server does.
@@ -316,7 +331,7 @@ class DynamicTrajectoryActionServer(StretchTrajectoryActionServer):
                 overspeed_since[i] = None
         return None
 
-    def _publish(self, goal_handle, joints, tau, scale, target, check, now, desired, actual, commands, start, held):
+    def _publish(self, goal_handle, joints, tau, scale, target, check, now, desired, actual, commands, start, gate):
         feedback = FollowJointTrajectory.Feedback(joint_names=joints)
         feedback.desired = JointTrajectoryPoint(positions=list(desired), time_from_start=duration_msg(tau))
         feedback.actual = JointTrajectoryPoint(positions=list(actual), time_from_start=duration_msg(
@@ -326,10 +341,11 @@ class DynamicTrajectoryActionServer(StretchTrajectoryActionServer):
         self.pub_desired_state.publish(JointState(name=joints, position=list(desired)))
         self.pub_actual_state.publish(JointState(name=joints, position=list(actual)))
         self.pub_commands.publish(JointState(name=joints, velocity=[float(c) for c in commands]))
-        # tau and the scale, as a JointState so it plots with the rest
+        # tau and the scale, as a JointState so it plots with the rest; gate is the ResumeGate
+        # state (0 free, 1 stopped, 2 creeping)
         self._pub_timing.publish(JointState(
-            header=Header(stamp=stamp), name=["tau", "scale", "target_scale", "check_age", "held"],
-            position=[tau, scale, target, (now - check.stamp) if check is not None else -1.0, float(held)]))
+            header=Header(stamp=stamp), name=["tau", "scale", "target_scale", "check_age", "gate"],
+            position=[tau, scale, target, (now - check.stamp) if check is not None else -1.0, float(gate)]))
 
     # --- checks ----------------------------------------------------------------------------------
 

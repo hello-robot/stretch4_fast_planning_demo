@@ -10,8 +10,10 @@ The scale comes from obstacle checks of the motion ahead: each checked segment o
 time has a cap (planned time / the least time the check allows; 0 if the segment is blocked).
 The scale must be down to each cap by the time tau reaches that segment, braking no harder
 than the joints can, and it never runs past the end of what's been checked. Once the checks
-have stopped the robot for a blocked path, it stays stopped until several checks in a row say
-it can go (ResumeGate), and then speeds up gently.
+have stopped the robot for a blocked path, it stays stopped for a moment, then may creep
+toward the block at a low speed while the path just ahead is clear, and goes back to full
+speed only once several checks in a row see nothing blocked (ResumeGate); then it speeds up
+gently.
 """
 
 from dataclasses import dataclass, field
@@ -133,31 +135,66 @@ def step_scale(scale, target, rate, dt, up_rate=None):
 def stopping_for_block(check, target):
     """Whether a check brings the robot to a stop for a blocked segment (not just slowing for
     one further ahead): the target is 0 and a segment ahead is blocked."""
-    return target <= 1e-6 and bool(np.any(check.caps == 0.0))
+    return target <= 1e-6 and blocked_anywhere(check)
+
+
+def blocked_anywhere(check):
+    """Whether any segment of a check is blocked."""
+    return bool(np.any(check.caps == 0.0))
+
+
+def creep_scale(trajectory, tau0, tau1, speed, levers):
+    """The scale at which no point of the robot moves faster than `speed` (m/s) over trajectory
+    time [tau0, tau1], bounding the fastest point's planned speed by each joint's top speed
+    times its lever (m per unit of joint motion: 1 for the lift and arm, the robot's reach for
+    base rotation, the gripper's length for a wrist joint), summed. At most 1."""
+    top = float(np.sum(trajectory.max_speed(tau0, max(tau0, tau1)) * np.asarray(levers)))
+    return 1.0 if top <= speed else speed / top
 
 
 class ResumeGate:
-    """Holds the robot after the checks stop it for a blocked path, until clear_checks fresh
-    checks in a row let it go and at least delay s have passed since the last blocking one.
+    """What the robot may do after the checks stop it for a blocked path (Elaine, 2026-10-22:
+    stop, then edge slowly toward the obstacle while there's still some clear space, then stop
+    very close to it, e.g. for making contact on purpose):
+
+    - STOPPED for delay s from the check that stopped it;
+    - then CREEPING (the caller caps the speed), stopping again before the block as usual
+      whenever the checks say so;
+    - FREE again once clear_checks checks in a row see nothing blocked and delay s have passed
+      since the last one that did.
 
     On the robot (2026-10-20), single checks came back clear between blocked ones while a hand
-    was in the way, and each one restarted the arm toward the hand at 60-70% speed.
+    was in the way, and each restarted the arm toward the hand at 60-70% speed; on 2026-10-22,
+    checks that saw the block a few cm ahead instead of right away did the same at up to 80%.
     """
+
+    FREE, STOPPED, CREEPING = 0, 1, 2
 
     def __init__(self, clear_checks, delay):
         self.clear_checks = clear_checks
         self.delay = delay
-        self.held = False
+        self.state = self.FREE
         self._clear = 0
+        self._stopped_at = None
         self._blocked_at = None
 
-    def update(self, stamp, blocking):
-        """Count one new check (stamp: when it was asked, s), which stops the robot for a block
-        or not; returns whether the robot is held."""
-        if blocking:
-            self.held, self._clear, self._blocked_at = True, 0, stamp
-        elif self.held:
+    @property
+    def held(self):
+        return self.state != self.FREE
+
+    def update(self, stamp, stopping, blocked):
+        """Count one new check (stamp: when it was asked, s): whether it stops the robot for a
+        block, and whether it sees a block anywhere. Returns the new state."""
+        if stopping and not self.held:
+            self.state, self._stopped_at = self.STOPPED, stamp
+        if not self.held:
+            return self.state
+        if stopping or blocked:
+            self._clear, self._blocked_at = 0, stamp
+        else:
             self._clear += 1
-            if self._clear >= self.clear_checks and stamp - self._blocked_at >= self.delay:
-                self.held = False
-        return self.held
+        if self._clear >= self.clear_checks and stamp - self._blocked_at >= self.delay:
+            self.state = self.FREE
+        elif self.state == self.STOPPED and stamp - self._stopped_at >= self.delay:
+            self.state = self.CREEPING
+        return self.state
