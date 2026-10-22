@@ -167,14 +167,51 @@ def creep_scale(trajectory, tau0, tau1, speed, levers):
     return 1.0 if top <= speed else speed / top
 
 
-def creeping_limits(trajectory, tau, tau1, check, speed, acceleration, levers):
+def travel(trajectory, tau0, tau1, levers):
+    """The most any point of the robot moves between trajectory times tau0 and tau1 (m),
+    bounded as in creep_scale: each joint's change times its lever, summed."""
+    q0, q1 = trajectory.sample(tau0)[0], trajectory.sample(tau1)[0]
+    return float(np.sum(np.abs(q1 - q0) * np.asarray(levers)))
+
+
+def with_standoff(trajectory, tau, check, standoff, levers, step=0.01):
+    """The check with its first block brought standoff m nearer along the path (at the robot's
+    fastest point; walked back in steps of `step` s of trajectory time, but no nearer than tau),
+    so stopping before it stops that far short of the obstacle."""
+    if check is None:
+        return None
+    blocked = np.flatnonzero((check.caps <= 0.0) & (check.ends > tau))
+    if standoff <= 0.0 or not blocked.size:
+        return check
+    b = int(blocked[0])
+    block_at = max(tau, float(check.starts[b]))
+    hold, moved = block_at, 0.0
+    while hold > tau and moved < standoff:
+        earlier = max(tau, hold - step)
+        moved += travel(trajectory, earlier, hold, levers)
+        hold = earlier
+    # Segments before the hold point (cut short at it), then one blocked from it to the block.
+    before = np.flatnonzero(check.starts < hold)
+    unsafe = check.unsafe if len(check.unsafe) == len(check.caps) else np.zeros(len(check.caps), dtype=bool)
+    return CheckResult(
+        starts=np.r_[check.starts[before], hold, check.starts[b:]],
+        ends=np.r_[np.minimum(check.ends[before], hold), block_at, check.ends[b:]],
+        caps=np.r_[check.caps[before], 0.0, check.caps[b:]],
+        unsafe=np.r_[unsafe[before], False, unsafe[b:]],
+        stamp=check.stamp)
+
+
+def creeping_limits(trajectory, tau, tau1, check, speed, acceleration, levers, standoff=0.0):
     """(target scale, the most it may rise per s) while creeping toward a block: no point of the
     robot faster than `speed` (m/s), and speeding up and braking for what the check says is
     ahead at no more than `acceleration` (m/s^2 at the fastest point), so each creep is a smooth
-    step rather than a jerk (Elaine, 2026-10-22). Slowing for a block that appears right ahead
-    is still up to the caller's usual rate."""
+    step rather than a jerk (Elaine, 2026-10-22). It stops `standoff` m short of the block: the
+    robot can't see anything within its self-filter padding (3 cm) of itself, so creeping right
+    up to a block would carry on into it, unseen (robot_lift_hand_12, 2026-10-22). Slowing for a
+    block that appears right ahead is still up to the caller's usual rate."""
     cap = creep_scale(trajectory, tau, tau1, speed, levers)
     rate = acceleration * cap / speed
+    check = with_standoff(trajectory, tau, check, standoff, levers)
     return min(target_scale(tau, check, rate, trajectory.duration), cap), rate
 
 

@@ -5,7 +5,7 @@ import pytest
 
 from stretch_dynamic_trajectory.timing import (CheckResult, ResumeGate, Trajectory, blocked_anywhere, check_times,
                                                creep_scale, creeping_limits, scale_deceleration, segment_caps, step_scale,
-                                               stopping_for_block, target_scale)
+                                               stopping_for_block, target_scale, with_standoff)
 
 
 def line(duration=2.0, distance=0.3):
@@ -69,7 +69,7 @@ def simulate(trajectory, cap_at, a, dt=0.02, seconds=6.0, horizon=1.0, step=0.1,
     """Run the scale and tau forward with checks every 0.1 s, as the server does; cap_at(t, tau)
     gives the cap at trajectory time tau at wall time t, and a segment gets the tightest cap
     anywhere in it (as a real check sweeps the whole segment). creep: (speed, acceleration,
-    levers) while the gate lets the robot creep. Returns arrays of (t, tau, scale)."""
+    levers[, standoff]) while the gate lets the robot creep. Returns arrays of (t, tau, scale)."""
     tau, scale, rows, result = 0.0, 0.0, [], None
     for k in range(int(seconds / dt)):
         t = k * dt
@@ -254,3 +254,46 @@ def test_check_times_are_finer_near_the_robot_when_asked():
     assert fine == pytest.approx([1.02, 1.04, 1.06, 1.08, 1.1, 1.2, 1.3, 1.4, 1.5, 1.6, 1.7, 1.8, 1.9, 2.0])
     assert check_times(1.0, 1.05, 0.1, fine_step=0.02, fine_until=1.3) == pytest.approx([1.02, 1.04, 1.05])
     assert check_times(2.0, 2.0, 0.1) == [2.0]
+
+
+def test_the_standoff_brings_the_first_block_nearer_by_that_much_travel():
+    trajectory = line(duration=4.0, distance=0.2)
+    result = check(np.arange(1.0, 2.0, 0.1), [1.0] * 6 + [0.0] * 4, checked_until=2.0)  # blocked from 1.6
+    moved = with_standoff(trajectory, 1.0, result, 0.03, [1.0])
+    hold = moved.starts[moved.caps == 0.0][0]
+    position = lambda u: trajectory.sample(u)[0][0]  # noqa: E731
+    assert position(1.6) - position(hold) == pytest.approx(0.03, abs=0.001)
+    assert np.all(moved.caps[moved.starts < hold] == 1.0) and moved.ends[moved.starts < hold].max() <= hold
+    assert moved.checked_until == result.checked_until
+    # Nearer than the standoff already: hold right here.
+    near = with_standoff(trajectory, 1.55, result, 0.03, [1.0])
+    assert near.starts[near.caps == 0.0][0] == pytest.approx(1.55)
+    assert with_standoff(trajectory, 1.0, None, 0.03, [1.0]) is None
+    unblocked = check(np.arange(1.0, 2.0, 0.1), [1.0] * 10, checked_until=2.0)
+    assert with_standoff(trajectory, 1.0, unblocked, 0.03, [1.0]) is unblocked
+
+
+def test_creeping_stops_the_standoff_short_of_a_block():
+    # robot_lift_hand_12 (2026-10-22): within the self-filter padding (3 cm) the robot can't see
+    # an obstacle, so creeping right up to a block carried on into Elaine's hand. With a 5 cm
+    # standoff the robot holds while the block is still in view.
+    # The block is first seen just ahead, stopping the robot, then further on (9 cm on, within
+    # the checked horizon, so the robot keeps creeping rather than going back to full speed).
+    trajectory = line(duration=4.0, distance=0.2)
+    a = scale_deceleration(trajectory, 0.0, 4.0, [0.7], max_rate=5.0)
+
+    def cap_at(t, tau):
+        if t < 1.0 or t >= 12.0:
+            return 1.0
+        return 0.0 if tau >= (1.1 if t < 2.0 else 2.6) else 1.0
+
+    t, tau, scale = simulate(trajectory, cap_at, a, seconds=16.0, horizon=2.0, gate=ResumeGate(3, 0.5), up_rate=2.0,
+                             creep=(0.02, 0.1, [1.0], 0.05)).T
+    position = np.array([trajectory.sample(u)[0][0] for u in tau])
+    block = trajectory.sample(2.6)[0][0]
+    assert block - position[(t > 1.5) & (t < 2.0)].max() > 0.08  # stopped well short at first
+    held = position[(t > 10.0) & (t < 12.0)]
+    assert held.max() <= block - 0.05 + 0.002  # never nearer than the standoff
+    assert held.min() >= block - 0.05 - 0.01  # but crept up to it
+    assert tau[-1] == pytest.approx(4.0)  # and finished once the block went away
+

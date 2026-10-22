@@ -11,8 +11,8 @@ kept low enough to be down to each segment's allowed speed when the robot gets t
 stop before a blocked segment, and to stop by the end of what's been checked. Without a fresh
 answer (check_timeout) the robot slows to a stop. Once the checks stop the robot for a blocked
 path, it stays stopped for resume_delay s, then creeps toward the block at no more than
-creep_speed (at any point of the robot) while the path just ahead is clear, stopping before
-the block as usual, and goes back to full speed once resume_clear_checks checks in a row see
+creep_speed (at any point of the robot) while the path just ahead is clear, stopping
+creep_standoff short of the block, and goes back to full speed once resume_clear_checks checks in a row see
 nothing blocked and resume_delay s have passed. The scale never rises faster than
 max_scale_up_rate. Each check's details (which
 segment and shape limit the motion, clearances, blocked segments) are published on
@@ -111,6 +111,9 @@ class DynamicTrajectoryActionServer(StretchTrajectoryActionServer):
         add_param("resume_delay", 0.5)
         add_param("creep_speed", 0.02)
         add_param("creep_acceleration", 0.1)
+        # Creeping stops this far (m, at the fastest point) short of a block: more than the grid's
+        # self-filter padding (3 cm), within which the robot can't see an obstacle, plus a voxel.
+        add_param("creep_standoff", 0.05)
         # While held, the first creep_check_fine_horizon s of each check go in steps of
         # creep_check_step, so a block near the robot is placed closely enough to brake for gently.
         add_param("creep_check_step", 0.02)
@@ -265,6 +268,7 @@ class DynamicTrajectoryActionServer(StretchTrajectoryActionServer):
         gate = ResumeGate(self.get_param("resume_clear_checks"), self.get_param("resume_delay"))
         gated_stamp = None  # the last check counted by the gate
         creep_speed, creep_acceleration = self.get_param("creep_speed"), self.get_param("creep_acceleration")
+        creep_standoff = self.get_param("creep_standoff")
         levers = np.array([CREEP_LEVERS.get(j, 1.0) for j in joints])
         check_timeout = self.get_param("check_timeout")
         max_lag = self.get_param("max_lag_tolerances")
@@ -297,7 +301,7 @@ class DynamicTrajectoryActionServer(StretchTrajectoryActionServer):
                 target = 0.0
             elif gate.state == ResumeGate.CREEPING:
                 creep_target, creep_rate = creeping_limits(plan, tau, horizon_end, check, creep_speed,
-                                                           creep_acceleration, levers)
+                                                           creep_acceleration, levers, creep_standoff)
                 target, up_rate = min(target, creep_target), min(up_rate, creep_rate)
             scale = step_scale(scale, target, rate_limit, dt, up_rate=up_rate)
 
