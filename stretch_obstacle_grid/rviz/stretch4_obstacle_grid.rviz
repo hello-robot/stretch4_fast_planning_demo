@@ -7,12 +7,12 @@ Panels:
         - /Global Options1
         - /Status1
         - /PointCloud21
-        - /PointCloud21/Status1
         - /PointCloud22
         - /PointCloud23
         - /PointCloud24
         - /PointCloud25
-      Splitter Ratio: 0.5
+        - /PointCloud26
+      Splitter Ratio: 0.5043370723724365
     Tree Height: 1236
   - Class: rviz_common/Selection
     Name: Selection
@@ -52,6 +52,39 @@ Visualization Manager:
       Plane: XY
       Plane Cell Count: 10
       Reference Frame: <Fixed Frame>
+      Value: true
+    - Alpha: 1
+      Autocompute Intensity Bounds: true
+      Autocompute Value Bounds:
+        Max Value: 10
+        Min Value: -10
+        Value: true
+      Axis: Z
+      Channel Name: intensity
+      Class: rviz_default_plugins/PointCloud2
+      Color: 100; 100; 100
+      Color Transformer: FlatColor
+      Decay Time: 0
+      Enabled: true
+      Invert Rainbow: false
+      Max Color: 255; 255; 255
+      Max Intensity: 4096
+      Min Color: 0; 0; 0
+      Min Intensity: 0
+      Name: PointCloud2
+      Position Transformer: XYZ
+      Selectable: true
+      Size (Pixels): 3
+      Size (m): 0.009999999776482582
+      Style: Spheres
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /obstacle_grid/shadow
+      Use Fixed Frame: true
+      Use rainbow: true
       Value: true
     - Alpha: 1
       Autocompute Intensity Bounds: true
@@ -131,7 +164,7 @@ Visualization Manager:
       Color: 160; 90; 200
       Color Transformer: FlatColor
       Decay Time: 0
-      Enabled: false
+      Enabled: true
       Invert Rainbow: false
       Max Color: 255; 255; 255
       Max Intensity: 4096
@@ -148,48 +181,15 @@ Visualization Manager:
         Durability Policy: Volatile
         History Policy: Keep Last
         Reliability Policy: Reliable
-        Value: /obstacle_grid/static
+        Value: /obstacle_grid/occupied
       Use Fixed Frame: true
       Use rainbow: true
-      Value: false
+      Value: true
     - Alpha: 1
       Autocompute Intensity Bounds: true
       Autocompute Value Bounds:
-        Max Value: 10
-        Min Value: -10
-        Value: true
-      Axis: Z
-      Channel Name: intensity
-      Class: rviz_default_plugins/PointCloud2
-      Color: 100; 100; 100
-      Color Transformer: FlatColor
-      Decay Time: 0
-      Enabled: false
-      Invert Rainbow: false
-      Max Color: 255; 255; 255
-      Max Intensity: 4096
-      Min Color: 0; 0; 0
-      Min Intensity: 0
-      Name: PointCloud2
-      Position Transformer: XYZ
-      Selectable: true
-      Size (Pixels): 3
-      Size (m): 0.009999999776482582
-      Style: Spheres
-      Topic:
-        Depth: 5
-        Durability Policy: Volatile
-        History Policy: Keep Last
-        Reliability Policy: Reliable
-        Value: /obstacle_grid/shadow
-      Use Fixed Frame: true
-      Use rainbow: true
-      Value: false
-    - Alpha: 1
-      Autocompute Intensity Bounds: true
-      Autocompute Value Bounds:
-        Max Value: 2.8851263523101807
-        Min Value: -18.35987091064453
+        Max Value: 3.656588077545166
+        Min Value: -0.00038909912109375
         Value: true
       Axis: Z
       Channel Name: intensity
@@ -221,8 +221,8 @@ Visualization Manager:
     - Alpha: 1
       Autocompute Intensity Bounds: true
       Autocompute Value Bounds:
-        Max Value: 2.909227132797241
-        Min Value: -0.037166714668273926
+        Max Value: 3.6566290855407715
+        Min Value: -0.0009908676147460938
         Value: true
       Axis: Z
       Channel Name: intensity
@@ -297,25 +297,25 @@ Visualization Manager:
   Views:
     Current:
       Class: rviz_default_plugins/Orbit
-      Distance: 1.7793678045272827
+      Distance: 1.6058921813964844
       Enable Stereo Rendering:
         Stereo Eye Separation: 0.05999999865889549
         Stereo Focal Distance: 1
         Swap Stereo Eyes: false
         Value: false
       Focal Point:
-        X: 0.22628457844257355
-        Y: 0.02382686547935009
-        Z: 0.4378158450126648
+        X: 0.03431324660778046
+        Y: -0.21520589292049408
+        Z: 0.853916347026825
       Focal Shape Fixed Size: true
       Focal Shape Size: 0.05000000074505806
       Invert Z Axis: false
       Name: Current View
       Near Clip Distance: 0.009999999776482582
-      Pitch: 0.41479697823524475
+      Pitch: 0.24979698657989502
       Target Frame: <Fixed Frame>
       Value: Orbit (rviz)
-      Yaw: 5.340820789337158
+      Yaw: 1.139466404914856
     Saved: ~
 Window Geometry:
   Displays:
@@ -333,5 +333,5 @@ Window Geometry:
   Views:
     collapsed: false
   Width: 2864
-  X: 782
-  Y: 154
+  X: 775
+  Y: 64
