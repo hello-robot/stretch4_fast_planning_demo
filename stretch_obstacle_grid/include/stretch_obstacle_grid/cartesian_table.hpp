@@ -32,11 +32,15 @@ public:
 
   // Flagged voxels overlapping the box (and possibly some up to a cell and a voxel outside it).
   uint32_t count(const Eigen::AlignedBox3f & box) const;
+  // Whether count(box) counts voxel `voxel` if it's flagged.
+  bool counts(const Eigen::AlignedBox3f & box, size_t voxel) const;
 
   float cell() const {return cell_;}
   float voxel_reach() const {return reach_;}
 
 private:
+  // The cells count(box) sums, as [lo, hi) per axis; false if there are none.
+  bool cell_range(const Eigen::AlignedBox3f & box, Eigen::Vector3i * lo, Eigen::Vector3i * hi) const;
   size_t sum_index(int x, int y, int z) const {return (static_cast<size_t>(x) * (ny_ + 1) + y) * (nz_ + 1) + z;}
 
   float cell_;

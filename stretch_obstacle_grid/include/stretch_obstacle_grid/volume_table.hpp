@@ -42,7 +42,14 @@ public:
   // never misses anything inside the box.
   uint32_t count(const CylinderBox & box) const;
 
+  // The voxels count(box) counts if flagged, as grid indices. Appends to `out`.
+  void voxels(const CylinderBox & box, std::vector<size_t> * out) const;
+
 private:
+  // Calls fn(band, r0, r1, t0, t1, z0, z1) for each bin range of a band that a box touches,
+  // as count(band, ...) takes them.
+  template<typename Fn>
+  void for_each_range(const CylinderBox & box, Fn && fn) const;
   size_t sum_index(int band, int r, int t, int z) const;  // r band-local, all +1 padded
 
   const CylindricalGrid & grid_;

@@ -219,6 +219,14 @@ PYBIND11_MODULE(stretch_obstacle_grid, m)
       const auto & labels = g.labels();
       return py::array_t<uint8_t>(static_cast<py::ssize_t>(labels.size()), labels.data());
     }, "A copy of the per-voxel labels (Label values).")
+  .def("seen_by", [](const ObstacleGrid & g, const std::vector<size_t> & voxels) {
+      py::array_t<uint8_t> out(static_cast<py::ssize_t>(voxels.size()));
+      auto view = out.mutable_unchecked<1>();
+      for (size_t i = 0; i < voxels.size(); ++i) {
+        view(i) = g.seen_by(voxels[i]);
+      }
+      return out;
+    }, py::arg("voxels"), "Per voxel: bit i set if LiDAR i's latest frame has a non-robot return in it.")
   .def("count_occupied", &ObstacleGrid::count_occupied, py::arg("box"))
   .def("count_unsafe", &ObstacleGrid::count_unsafe, py::arg("box"))
   .def("oldest_stamp", &ObstacleGrid::oldest_stamp)
@@ -282,6 +290,15 @@ PYBIND11_MODULE(stretch_obstacle_grid, m)
   .def_readonly("unsafe", &StepLimit::unsafe)
   .def_readonly("shape", &StepLimit::shape);
 
+  py::enum_<HitKind>(m, "HitKind")
+  .value("OBSTACLES", HitKind::kObstacles)
+  .value("UNSAFE", HitKind::kUnsafe);
+
+  py::class_<StepHit>(m, "StepHit")
+  .def_readonly("voxel", &StepHit::voxel)
+  .def_readonly("shape", &StepHit::shape)
+  .def_readonly("in_both", &StepHit::in_both);
+
   m.def("cylinder_bounds", &cylinder_bounds, py::arg("points"),
     "Bounds of a convex set of points (list of xyz) in cylindrical coordinates.");
   m.def("piece_corners", &piece_corners, py::arg("shape"), py::arg("f0") = Eigen::Vector3f::Zero(),
@@ -302,6 +319,12 @@ PYBIND11_MODULE(stretch_obstacle_grid, m)
     }, py::arg("grid"), py::arg("samples"), py::arg("age") = 0.0f, py::arg("theta_slack") = 0.0f,
     py::arg("braking") = std::vector<float>(),
     "Limits for each step between consecutive posed bodies (SelfModels) along a motion.")
+  .def("step_hits", [](const MotionCheck & c, const ObstacleGrid & grid, const std::vector<SelfModel> & samples,
+    size_t step, HitKind kind, float theta_slack) {
+      py::gil_scoped_release release;
+      return c.step_hits(grid, samples, step, kind, theta_slack);
+    }, py::arg("grid"), py::arg("samples"), py::arg("step"), py::arg("kind"), py::arg("theta_slack") = 0.0f,
+    "The voxels behind one step of check() being blocked or unsafe: StepHits, by voxel.")
   .def("clearance_occupied", [](const MotionCheck & c, const ObstacleGrid & g, const CylinderBox & box) {
       return c.clearance(g.occupied_table(), box);
     }, py::arg("grid"), py::arg("box"))

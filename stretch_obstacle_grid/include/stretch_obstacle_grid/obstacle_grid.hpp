@@ -161,6 +161,9 @@ public:
   void update(const SelfModel & self, const Eigen::Isometry3f & world_from_base = Eigen::Isometry3f::Identity());
 
   const std::vector<uint8_t> & labels() const {return labels_;}
+  // Bit i set if LiDAR i's latest frame (as of the last update) has a return from something
+  // other than the robot in the voxel.
+  uint8_t seen_by(size_t voxel) const {return occupied_by_[voxel];}
   // Box counts of obstacles (occupied or static), of the ones that may move (occupied), and
   // of unsafe space, for boxes in (theta, r, z) and in x, y, z.
   uint32_t count_occupied(const CylinderBox & box) const {return occupied_table_.count(box);}
@@ -206,7 +209,7 @@ private:
   SelfModel static_self_;
   std::vector<uint8_t> static_self_flags_;            // static_self_ rasterized
   std::vector<uint8_t> self_flags_;    // scratch for update(): the robot's body now
-  std::vector<uint8_t> occupied_by_;   // scratch for update(): bit i set if LiDAR i's frame has a return here
+  std::vector<uint8_t> occupied_by_;   // from update(): bit i set if LiDAR i's frame has a return here
   // Scratch for add_frame: each range image cell's nearest return (point index, or -1), and
   // the clusters they form (union-find parents and sizes, per cell).
   std::vector<int32_t> nearest_in_cell_;

@@ -4,6 +4,7 @@
 #include <array>
 #include <cmath>
 #include <limits>
+#include <stdexcept>
 
 namespace stretch_obstacle_grid
 {
@@ -98,36 +99,109 @@ struct SweptPiece
   Eigen::AlignedBox3f box;  // the corners at both ends, grown by half the travel
   float theta_slack;        // rad of base rotation the grid may lag by
 
-  bool clear(const VolumeTable & cylinder_table, const CartesianTable & box_table, float d) const
+  CylinderBox cylinder_at(float d) const {return widen_theta(grow(cylinder, d), theta_slack);}
+
+  Eigen::AlignedBox3f box_at(float d) const
   {
-    if (cylinder_table.count(widen_theta(grow(cylinder, d), theta_slack)) == 0) {
-      return true;
-    }
     // Turning by theta_slack moves a point at most its radius times that.
     const float x = std::max(std::abs(box.min().x()), std::abs(box.max().x()));
     const float y = std::max(std::abs(box.min().y()), std::abs(box.max().y()));
     const float g = d + std::hypot(x, y) * theta_slack;
-    return box_table.count(Eigen::AlignedBox3f(box.min().array() - g, box.max().array() + g)) == 0;
+    return Eigen::AlignedBox3f(box.min().array() - g, box.max().array() + g);
+  }
+
+  bool clear(const VolumeTable & cylinder_table, const CartesianTable & box_table, float d) const
+  {
+    return cylinder_table.count(cylinder_at(d)) == 0 || box_table.count(box_at(d)) == 0;
   }
 };
 
-// The largest d (to resolution) for which clear(d) holds, by bisection: 0 if it fails at 0,
-// max_clearance if it holds there. `known_clear`: a d already known to hold.
-template<typename Clear>
-float search_clearance(const Clear & clear, const MotionLimits & limits, float known_clear = 0.0f)
+// How many pieces each shape is cut into along each of its axes: as many as its longest
+// size over the samples needs (the arm box changes length), so every sample has the same pieces.
+std::vector<Eigen::Vector3i> piece_cuts(const std::vector<SelfModel> & samples, float max_piece)
 {
+  const size_t shape_count = samples[0].shapes().size();
+  std::vector<Eigen::Vector3i> cuts(shape_count);
+  for (size_t s = 0; s < shape_count; ++s) {
+    Eigen::Vector3f longest = Eigen::Vector3f::Zero();
+    for (const auto & sample : samples) {
+      longest = longest.cwiseMax(2.0f * half_box(sample.shapes()[s]));
+    }
+    for (int i = 0; i < 3; ++i) {
+      cuts[s][i] = std::max(1, static_cast<int>(std::ceil(longest[i] / max_piece)));
+    }
+  }
+  return cuts;
+}
+
+// Every piece of one sample, shape by shape, with its bounds.
+std::vector<Piece> sample_pieces(const SelfModel & sample, const std::vector<Eigen::Vector3i> & cuts)
+{
+  std::vector<Piece> pieces;
+  for (size_t s = 0; s < cuts.size(); ++s) {
+    const SelfShape & shape = sample.shapes()[s];
+    const Eigen::Vector3f step = cuts[s].cast<float>().cwiseInverse();
+    for (int p = 0; p < cuts[s].prod(); ++p) {
+      const Eigen::Vector3i at(p % cuts[s][0], (p / cuts[s][0]) % cuts[s][1], p / (cuts[s][0] * cuts[s][1]));
+      const Eigen::Vector3f f0 = at.cast<float>().cwiseProduct(step);
+      Piece piece;
+      piece.corners = piece_corners(shape, f0, f0 + step);
+      piece.bounds = cylinder_bounds(piece.corners);
+      pieces.push_back(std::move(piece));
+    }
+  }
+  return pieces;
+}
+
+// A rigid (or stretching) motion moves every point of a box no more than its corners.
+float piece_travel(const Piece & a, const Piece & b)
+{
+  float travel = 0.0f;
+  for (size_t c = 0; c < a.corners.size(); ++c) {
+    travel = std::max(travel, (b.corners[c] - a.corners[c]).norm());
+  }
+  return travel;
+}
+
+// A piece's volume between two samples.
+SweptPiece sweep(const Piece & a, const Piece & b, float travel, float theta_slack)
+{
+  SweptPiece swept{grow(merge(a.bounds, b.bounds), 0.5f * travel), Eigen::AlignedBox3f(), theta_slack};
+  for (size_t c = 0; c < a.corners.size(); ++c) {
+    swept.box.extend(a.corners[c]);
+    swept.box.extend(b.corners[c]);
+  }
+  swept.box.min().array() -= 0.5f * travel;
+  swept.box.max().array() += 0.5f * travel;
+  return swept;
+}
+
+// The largest d (to resolution) for which clear(d) holds, by bisection: 0 if it fails at 0,
+// max_clearance if it holds there. `known_clear`: a d already known to hold. `failing`, if
+// given, gets the smallest d found to fail (infinity if none did).
+template<typename Clear>
+float search_clearance(
+  const Clear & clear, const MotionLimits & limits, float known_clear = 0.0f, float * failing = nullptr)
+{
+  float hi = std::numeric_limits<float>::infinity();
+  auto done = [&](float d) {
+      if (failing) {*failing = hi;}
+      return d;
+    };
   if (known_clear <= 0.0f && !clear(0.0f)) {
-    return 0.0f;
+    hi = 0.0f;
+    return done(0.0f);
   }
   if (known_clear >= limits.max_clearance || clear(limits.max_clearance)) {
-    return limits.max_clearance;
+    return done(limits.max_clearance);
   }
-  float lo = known_clear, hi = limits.max_clearance;
+  float lo = known_clear;
+  hi = limits.max_clearance;
   while (hi - lo > limits.clearance_resolution) {
     const float middle = 0.5f * (lo + hi);
     (clear(middle) ? lo : hi) = middle;
   }
-  return lo;
+  return done(lo);
 }
 
 }  // namespace
@@ -265,35 +339,16 @@ std::vector<StepLimit> MotionCheck::check(
     }
   }
 
-  // Cut each shape into the same pieces at every sample (the arm box changes length): along
-  // each of its axes, into as many as its longest size over the samples needs. Then bound
-  // every piece at every sample.
-  std::vector<Eigen::Vector3i> cuts(shape_count);
+  // Cut each shape into the same pieces at every sample, and bound every piece at every sample.
+  const std::vector<Eigen::Vector3i> cuts = piece_cuts(samples, limits_.max_piece);
   std::vector<int> piece_count(shape_count);
   for (size_t s = 0; s < shape_count; ++s) {
-    Eigen::Vector3f longest = Eigen::Vector3f::Zero();
-    for (const auto & sample : samples) {
-      longest = longest.cwiseMax(2.0f * half_box(sample.shapes()[s]));
-    }
-    for (int i = 0; i < 3; ++i) {
-      cuts[s][i] = std::max(1, static_cast<int>(std::ceil(longest[i] / limits_.max_piece)));
-    }
     piece_count[s] = cuts[s].prod();
   }
-  std::vector<std::vector<Piece>> pieces(samples.size());  // [sample][piece]
-  for (size_t k = 0; k < samples.size(); ++k) {
-    for (size_t s = 0; s < shape_count; ++s) {
-      const SelfShape & shape = samples[k].shapes()[s];
-      const Eigen::Vector3f step = cuts[s].cast<float>().cwiseInverse();
-      for (int p = 0; p < piece_count[s]; ++p) {
-        const Eigen::Vector3i at(p % cuts[s][0], (p / cuts[s][0]) % cuts[s][1], p / (cuts[s][0] * cuts[s][1]));
-        const Eigen::Vector3f f0 = at.cast<float>().cwiseProduct(step);
-        Piece piece;
-        piece.corners = piece_corners(shape, f0, f0 + step);
-        piece.bounds = cylinder_bounds(piece.corners);
-        pieces[k].push_back(std::move(piece));
-      }
-    }
+  std::vector<std::vector<Piece>> pieces;  // [sample][piece]
+  pieces.reserve(samples.size());
+  for (const auto & sample : samples) {
+    pieces.push_back(sample_pieces(sample, cuts));
   }
 
   // Moving obstacles (and anything in unsafe space) may have come this much closer since the
@@ -311,22 +366,11 @@ std::vector<StepLimit> MotionCheck::check(
       for (int p = 0; p < piece_count[s]; ++p, ++piece_index) {
         const Piece & a = pieces[k][piece_index];
         const Piece & b = pieces[k + 1][piece_index];
-        // A rigid (or stretching) motion moves every point of a box no more than its corners.
-        float travel = 0.0f;
-        for (size_t c = 0; c < a.corners.size(); ++c) {
-          travel = std::max(travel, (b.corners[c] - a.corners[c]).norm());
-        }
+        const float travel = piece_travel(a, b);
         if (travel < limits_.min_motion) {
           continue;
         }
-
-        SweptPiece swept{grow(merge(a.bounds, b.bounds), 0.5f * travel), Eigen::AlignedBox3f(), theta_slack};
-        for (size_t c = 0; c < a.corners.size(); ++c) {
-          swept.box.extend(a.corners[c]);
-          swept.box.extend(b.corners[c]);
-        }
-        swept.box.min().array() -= 0.5f * travel;
-        swept.box.max().array() += 0.5f * travel;
+        const SweptPiece swept = sweep(a, b, travel, theta_slack);
         const float to_occupied = search_clearance([&](float d) {
               return swept.clear(grid.occupied_table(), grid.occupied_box_table(), d);
             }, limits_);
@@ -359,6 +403,66 @@ std::vector<StepLimit> MotionCheck::check(
     }
   }
   return steps;
+}
+
+std::vector<StepHit> MotionCheck::step_hits(
+  const ObstacleGrid & grid, const std::vector<SelfModel> & samples, size_t step, HitKind kind,
+  float theta_slack) const
+{
+  if (step + 1 >= samples.size()) {
+    throw std::invalid_argument("MotionCheck::step_hits: no such step");
+  }
+  const bool obstacles = kind == HitKind::kObstacles;
+  const uint32_t mask = obstacles ? (1u << kOccupied) | (1u << kStatic) : (1u << kUnknown) | (1u << kContaminatedShadow);
+  const VolumeTable & cylinder_table = obstacles ? grid.occupied_table() : grid.unsafe_table();
+  const CartesianTable & box_table = obstacles ? grid.occupied_box_table() : grid.unsafe_box_table();
+  const std::vector<uint8_t> & labels = grid.labels();
+
+  const std::vector<Eigen::Vector3i> cuts = piece_cuts(samples, limits_.max_piece);
+  const std::vector<Piece> a = sample_pieces(samples[step], cuts);
+  const std::vector<Piece> b = sample_pieces(samples[step + 1], cuts);
+  std::vector<StepHit> hits;
+  std::vector<size_t> voxels;
+  size_t piece_index = 0;
+  for (size_t s = 0; s < cuts.size(); ++s) {
+    for (int p = 0; p < cuts[s].prod(); ++p, ++piece_index) {
+      const float travel = piece_travel(a[piece_index], b[piece_index]);
+      if (travel < limits_.min_motion) {
+        continue;
+      }
+      const SweptPiece swept = sweep(a[piece_index], b[piece_index], travel, theta_slack);
+      // As check() decides it: clearance 0 to resolution. The voxels are the ones within the
+      // smallest distance that failed (0 if the sweep itself holds some).
+      float d = 0.0f;
+      if (search_clearance([&](float x) {return swept.clear(cylinder_table, box_table, x);}, limits_, 0.0f, &d) > 0.0f) {
+        continue;
+      }
+      const Eigen::AlignedBox3f box = swept.box_at(d);
+      voxels.clear();
+      cylinder_table.voxels(swept.cylinder_at(d), &voxels);
+      const size_t first = hits.size();
+      for (size_t voxel : voxels) {
+        if ((mask >> labels[voxel] & 1u) && box_table.counts(box, voxel)) {
+          hits.push_back(StepHit{voxel, static_cast<int>(s), true});
+        }
+      }
+      if (hits.size() == first) {  // no voxel in both: list the cylindrical bound's
+        for (size_t voxel : voxels) {
+          if (mask >> labels[voxel] & 1u) {
+            hits.push_back(StepHit{voxel, static_cast<int>(s), false});
+          }
+        }
+      }
+    }
+  }
+  // One entry per voxel: the first shape that holds it, in both bounds if any does.
+  std::stable_sort(hits.begin(), hits.end(), [](const StepHit & x, const StepHit & y) {
+      return x.voxel < y.voxel || (x.voxel == y.voxel && x.in_both && !y.in_both);
+    });
+  hits.erase(std::unique(hits.begin(), hits.end(), [](const StepHit & x, const StepHit & y) {
+      return x.voxel == y.voxel;
+    }), hits.end());
+  return hits;
 }
 
 }  // namespace stretch_obstacle_grid

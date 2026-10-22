@@ -155,6 +155,33 @@ TEST(VolumeTable, CountsMatchBruteForce)
   }
 }
 
+TEST(VolumeTable, VoxelsAreWhatCountCounts)
+{
+  const CylindricalGrid grid(small_config());
+  std::mt19937 rng(5);
+  std::bernoulli_distribution coin(0.1);
+  std::vector<uint8_t> flags(grid.size());
+  for (auto & f : flags) {f = coin(rng);}
+  VolumeTable table(grid);
+  table.build(flags, 1u << 1);
+
+  std::uniform_real_distribution<float> unit(0.0f, 1.0f);
+  for (int k = 0; k < 100; ++k) {
+    const float theta_min = (unit(rng) - 0.5f) * 4.0f * kPi;
+    const float span = unit(rng) < 0.1f ? 7.0f : unit(rng) * 3.0f;
+    const float r_a = unit(rng), r_b = unit(rng), z_a = unit(rng) * 0.4f, z_b = unit(rng) * 0.4f;
+    const CylinderBox box{theta_min, theta_min + span, std::min(r_a, r_b), std::max(r_a, r_b),
+      std::min(z_a, z_b), std::max(z_a, z_b)};
+    std::vector<size_t> voxels;
+    table.voxels(box, &voxels);
+    uint32_t flagged = 0;
+    for (size_t v : voxels) {flagged += flags[v];}
+    EXPECT_EQ(flagged, table.count(box)) << "box " << k;
+    std::sort(voxels.begin(), voxels.end());
+    EXPECT_EQ(std::adjacent_find(voxels.begin(), voxels.end()), voxels.end()) << "box " << k;
+  }
+}
+
 // --- Robot shapes ---------------------------------------------------------------------------
 
 TEST(CartesianTable, CountsEveryOverlappingVoxel)
@@ -196,6 +223,11 @@ TEST(CartesianTable, CountsEveryOverlappingVoxel)
     const uint32_t counted = table.count(box);
     EXPECT_GE(counted, must);
     EXPECT_LE(counted, may);
+    uint32_t listed = 0;
+    for (size_t i = 0; i < grid.size(); ++i) {
+      listed += values[i] && table.counts(box, i);
+    }
+    EXPECT_EQ(listed, counted);
   }
 }
 
@@ -980,4 +1012,37 @@ TEST(MotionCheck, BaseRotationSweepsTheAnglesBetween)
   EXPECT_TRUE(steps[0].blocked);  // the post sits at 90 degrees, inside the first step's sweep
   EXPECT_TRUE(steps[1].blocked);
   EXPECT_GT(steps[0].travel, 0.9f * 2.0f * std::sin(0.7f));
+}
+
+TEST(MotionCheck, StepHitsAreTheVoxelsBehindABlock)
+{
+  Scene scene;
+  scene.obstacles.emplace_back(Eigen::Vector3f(1.0f, -0.1f, 0.0f), Eigen::Vector3f(1.1f, 0.1f, 1.0f));
+  const auto labeled = label_scene(scene);
+  std::vector<SelfModel> samples;
+  for (int i = 0; i <= 55; ++i) {samples.push_back(arm_at(scene, 0.01f * i));}
+  const MotionCheck checker;
+  const std::vector<StepLimit> steps = checker.check(*labeled, samples);
+  const uint32_t obstacles = (1u << kOccupied) | (1u << kStatic);
+
+  // Every step the check calls blocked has hits, and only those.
+  for (size_t k = 0; k < steps.size(); ++k) {
+    EXPECT_EQ(steps[k].blocked, !checker.step_hits(*labeled, samples, k, HitKind::kObstacles).empty()) << "step " << k;
+  }
+  // Reaching the post, the hits are voxels of the post, seen by the scene's LiDAR.
+  ASSERT_TRUE(steps.back().blocked);
+  const std::vector<StepHit> hits = checker.step_hits(*labeled, samples, steps.size() - 1, HitKind::kObstacles);
+  ASSERT_FALSE(hits.empty());
+  bool any_in_both = false;
+  for (const StepHit & hit : hits) {
+    EXPECT_TRUE(obstacles >> labeled->labels()[hit.voxel] & 1u);
+    EXPECT_EQ(hit.shape, 0);
+    EXPECT_NE(labeled->seen_by(hit.voxel), 0);
+    Eigen::Vector3f c;
+    labeled->grid().center(hit.voxel, &c.x(), &c.y(), &c.z());
+    EXPECT_GT(c.x(), 0.97f);  // the post's near face, give or take a voxel
+    any_in_both |= hit.in_both;
+  }
+  EXPECT_TRUE(any_in_both);
+  for (size_t k = 1; k < hits.size(); ++k) {EXPECT_LT(hits[k - 1].voxel, hits[k].voxel);}
 }

@@ -66,9 +66,25 @@ struct StepLimit
   float clearance_occupied = 0.0f;  // m to any obstacle, smallest over the step's moving pieces
   float clearance_moving = 0.0f;    // m to obstacles that aren't static, likewise
   float clearance_unsafe = 0.0f;    // m, likewise
-  bool blocked = false;       // a moving piece sweeps an occupied voxel
-  bool unsafe = false;        // a moving piece sweeps an unsafe voxel
+  // A moving piece sweeps an occupied (unsafe) voxel, or comes within the clearance search's
+  // resolution of one.
+  bool blocked = false;
+  bool unsafe = false;
   int shape = -1;             // index of the limiting piece's shape
+};
+
+// What step_hits lists: the voxels behind a block (obstacles) or behind sweeping unsafe space.
+enum class HitKind {kObstacles, kUnsafe};
+
+// A voxel behind one step of a check.
+struct StepHit
+{
+  size_t voxel;
+  int shape;  // the first shape (index in the samples) whose swept piece holds it
+  // True if both of the piece's bounds hold it. A piece counts as hitting when each bound holds
+  // some flagged voxel, not necessarily the same one, so at the edge of an obstacle neither
+  // may hold one the other does; then the cylindrical bound's voxels are listed, with false.
+  bool in_both;
 };
 
 // Bounds of a convex set of points (base_footprint) in cylindrical coordinates. When the set
@@ -113,6 +129,16 @@ public:
   std::vector<StepLimit> check(
     const ObstacleGrid & grid, const std::vector<SelfModel> & samples, float age = 0.0f,
     float theta_slack = 0.0f, const std::vector<float> & braking = {}) const;
+
+  // The voxels behind step `step` of check(grid, samples, ..., theta_slack) being blocked
+  // (kObstacles) or unsafe (kUnsafe): for each moving piece with clearance 0, the flagged
+  // voxels both its bounds hold (see StepHit::in_both), grown by the smallest distance the
+  // clearance search found blocked (0, or at most clearance_resolution). Empty exactly when
+  // check() finds the step clear. Sorted by voxel, one entry each. For showing why a step was
+  // limited.
+  std::vector<StepHit> step_hits(
+    const ObstacleGrid & grid, const std::vector<SelfModel> & samples, size_t step, HitKind kind,
+    float theta_slack = 0.0f) const;
 
   // Clearance (m, a lower bound to clearance_resolution) from a box to the voxels a table
   // flags: 0 if the box holds one, max_clearance if none are that close.

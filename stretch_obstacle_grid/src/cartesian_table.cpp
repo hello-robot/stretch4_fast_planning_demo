@@ -69,24 +69,44 @@ void CartesianTable::build(const std::vector<uint8_t> & values, uint32_t mask)
   }
 }
 
-uint32_t CartesianTable::count(const Eigen::AlignedBox3f & box) const
+bool CartesianTable::cell_range(const Eigen::AlignedBox3f & box, Eigen::Vector3i * lo, Eigen::Vector3i * hi) const
 {
   // Cells holding the center of any voxel that overlaps the box.
-  const Eigen::Vector3f lo = (box.min().array() - reach_ - origin_.array()) / cell_;
-  const Eigen::Vector3f hi = (box.max().array() + reach_ - origin_.array()) / cell_;
-  const int x0 = std::max(0, static_cast<int>(std::floor(lo.x())));
-  const int y0 = std::max(0, static_cast<int>(std::floor(lo.y())));
-  const int z0 = std::max(0, static_cast<int>(std::floor(lo.z())));
-  const int x1 = std::min(nx_, static_cast<int>(std::floor(hi.x())) + 1);
-  const int y1 = std::min(ny_, static_cast<int>(std::floor(hi.y())) + 1);
-  const int z1 = std::min(nz_, static_cast<int>(std::floor(hi.z())) + 1);
-  if (x0 >= x1 || y0 >= y1 || z0 >= z1) {
+  const Eigen::Vector3f a = (box.min().array() - reach_ - origin_.array()) / cell_;
+  const Eigen::Vector3f b = (box.max().array() + reach_ - origin_.array()) / cell_;
+  const Eigen::Vector3i n(nx_, ny_, nz_);
+  for (int i = 0; i < 3; ++i) {
+    (*lo)[i] = std::max(0, static_cast<int>(std::floor(a[i])));
+    (*hi)[i] = std::min(n[i], static_cast<int>(std::floor(b[i])) + 1);
+    if ((*lo)[i] >= (*hi)[i]) {
+      return false;
+    }
+  }
+  return true;
+}
+
+uint32_t CartesianTable::count(const Eigen::AlignedBox3f & box) const
+{
+  Eigen::Vector3i lo, hi;
+  if (!cell_range(box, &lo, &hi)) {
     return 0;
   }
+  const int x0 = lo.x(), y0 = lo.y(), z0 = lo.z(), x1 = hi.x(), y1 = hi.y(), z1 = hi.z();
   auto at = [&](int x, int y, int z) {return static_cast<int64_t>(sums_[sum_index(x, y, z)]);};
   return static_cast<uint32_t>(
     at(x1, y1, z1) - at(x0, y1, z1) - at(x1, y0, z1) - at(x1, y1, z0) +
     at(x0, y0, z1) + at(x0, y1, z0) + at(x1, y0, z0) - at(x0, y0, z0));
+}
+
+bool CartesianTable::counts(const Eigen::AlignedBox3f & box, size_t voxel) const
+{
+  Eigen::Vector3i lo, hi;
+  if (!cell_range(box, &lo, &hi)) {
+    return false;
+  }
+  const int32_t c = cell_of_voxel_[voxel];
+  const Eigen::Vector3i at(c / (nz_ * ny_), (c / nz_) % ny_, c % nz_);
+  return (at.array() >= lo.array()).all() && (at.array() < hi.array()).all();
 }
 
 }  // namespace stretch_obstacle_grid

@@ -103,7 +103,8 @@ uint32_t VolumeTable::count(int band, int r0, int r1, int t0, int t1, int z0, in
   return static_cast<uint32_t>(total);
 }
 
-uint32_t VolumeTable::count(const CylinderBox & box) const
+template<typename Fn>
+void VolumeTable::for_each_range(const CylinderBox & box, Fn && fn) const
 {
   const GridConfig & config = grid_.config();
   const float cell = config.cell;
@@ -114,14 +115,13 @@ uint32_t VolumeTable::count(const CylinderBox & box) const
   const int z_lo = std::max(0, static_cast<int>(std::floor((box.z_min - config.z_min) / cell)));
   const int z_hi = std::min(grid_.z_bins(), static_cast<int>(std::floor((box.z_max - config.z_min) / cell)) + 1);
   if (r_lo >= r_hi || z_lo >= z_hi || box.theta_max < box.theta_min) {
-    return 0;
+    return;
   }
 
   float start = std::fmod(box.theta_min, kTwoPi);
   if (start < 0.0f) {start += kTwoPi;}
   const float span = std::min(box.theta_max - box.theta_min, kTwoPi);
 
-  uint32_t total = 0;
   const auto & bands = grid_.bands();
   for (size_t b = 0; b < bands.size(); ++b) {
     const Band & band = bands[b];
@@ -134,15 +134,36 @@ uint32_t VolumeTable::count(const CylinderBox & box) const
     const int first = std::min(n - 1, static_cast<int>(start / band.dtheta));
     const int last = static_cast<int>((start + span) / band.dtheta);  // may pass n: wraps
     if (last - first + 1 >= n) {
-      total += count(b, r0, r1, 0, n, z_lo, z_hi);
+      fn(static_cast<int>(b), r0, r1, 0, n, z_lo, z_hi);
     } else if (last < n) {
-      total += count(b, r0, r1, first, last + 1, z_lo, z_hi);
+      fn(static_cast<int>(b), r0, r1, first, last + 1, z_lo, z_hi);
     } else {
-      total += count(b, r0, r1, first, n, z_lo, z_hi);
-      total += count(b, r0, r1, 0, last - n + 1, z_lo, z_hi);
+      fn(static_cast<int>(b), r0, r1, first, n, z_lo, z_hi);
+      fn(static_cast<int>(b), r0, r1, 0, last - n + 1, z_lo, z_hi);
     }
   }
+}
+
+uint32_t VolumeTable::count(const CylinderBox & box) const
+{
+  uint32_t total = 0;
+  for_each_range(box, [&](int b, int r0, int r1, int t0, int t1, int z0, int z1) {
+      total += count(b, r0, r1, t0, t1, z0, z1);
+    });
   return total;
+}
+
+void VolumeTable::voxels(const CylinderBox & box, std::vector<size_t> * out) const
+{
+  for_each_range(box, [&](int, int r0, int r1, int t0, int t1, int z0, int z1) {
+      for (int r = r0; r < r1; ++r) {
+        for (int t = t0; t < t1; ++t) {
+          for (int z = z0; z < z1; ++z) {
+            out->push_back(grid_.index(r, t, z));
+          }
+        }
+      }
+    });
 }
 
 }  // namespace stretch_obstacle_grid
