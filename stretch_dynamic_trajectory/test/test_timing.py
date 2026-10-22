@@ -3,8 +3,8 @@
 import numpy as np
 import pytest
 
-from stretch_dynamic_trajectory.timing import (CheckResult, ResumeGate, Trajectory, blocked_anywhere, creep_scale,
-                                               creeping_limits, scale_deceleration, segment_caps, step_scale,
+from stretch_dynamic_trajectory.timing import (CheckResult, ResumeGate, Trajectory, blocked_anywhere, check_times,
+                                               creep_scale, creeping_limits, scale_deceleration, segment_caps, step_scale,
                                                stopping_for_block, target_scale)
 
 
@@ -246,3 +246,11 @@ def test_creeping_brakes_gently_for_a_block_it_knows_about():
     near, rate = creeping_limits(trajectory, 1.49, 2.0, result, 0.02, 0.1, [1.0])
     assert 0.0 < near < cap  # already braking, gently, just short of the block
     assert near == pytest.approx(np.sqrt(2 * rate * 0.01))
+
+
+def test_check_times_are_finer_near_the_robot_when_asked():
+    assert check_times(1.0, 1.35, 0.1) == pytest.approx([1.1, 1.2, 1.3, 1.35])
+    fine = check_times(1.0, 2.0, 0.1, fine_step=0.02, fine_until=1.1)
+    assert fine == pytest.approx([1.02, 1.04, 1.06, 1.08, 1.1, 1.2, 1.3, 1.4, 1.5, 1.6, 1.7, 1.8, 1.9, 2.0])
+    assert check_times(1.0, 1.05, 0.1, fine_step=0.02, fine_until=1.3) == pytest.approx([1.02, 1.04, 1.05])
+    assert check_times(2.0, 2.0, 0.1) == [2.0]

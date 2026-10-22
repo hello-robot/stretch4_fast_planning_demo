@@ -45,7 +45,7 @@ from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 from hello_helpers.stretch4_ros_api import StretchTrajectoryActionServer
 from stretch_motion_planning_interfaces.srv import CheckMotion
 
-from stretch_dynamic_trajectory.timing import (CheckResult, ResumeGate, Trajectory, blocked_anywhere,
+from stretch_dynamic_trajectory.timing import (CheckResult, ResumeGate, Trajectory, blocked_anywhere, check_times,
                                                creeping_limits, scale_deceleration, segment_caps, step_scale,
                                                stopping_for_block, target_scale)
 
@@ -67,6 +67,7 @@ class DynamicTrajectoryActionServer(StretchTrajectoryActionServer):
         self._check = None  # the latest CheckResult
         self._check_lock = threading.Lock()
         self._state = None  # (tau, positions) shared with the check thread
+        self._held = False  # whether the resume gate holds the robot, for the check thread
         self._sensitivity = None
         super().__init__(driver, action_name="follow_joint_trajectory_dynamic",
                          param_prefix="dynamic_trajectory_server",
@@ -101,6 +102,10 @@ class DynamicTrajectoryActionServer(StretchTrajectoryActionServer):
         add_param("resume_delay", 0.5)
         add_param("creep_speed", 0.02)
         add_param("creep_acceleration", 0.1)
+        # While held, the first creep_check_fine_horizon s of each check go in steps of
+        # creep_check_step, so a block near the robot is placed closely enough to brake for gently.
+        add_param("creep_check_step", 0.02)
+        add_param("creep_check_fine_horizon", 0.3)
         # Progress along the path slows as the robot falls behind it, and stops once a joint is
         # this many of its tolerances behind (it can't keep up, or something holds it), so the
         # desired state never runs away from the robot.
@@ -174,6 +179,7 @@ class DynamicTrajectoryActionServer(StretchTrajectoryActionServer):
             with self._check_lock:
                 self._check = None
             self._state = (0.0, self._positions(joints))
+            self._held = False
             checker = threading.Thread(target=self._check_loop, args=(plan, joints, stop_checks), daemon=True)
             checker.start()
             result = self._follow(plan, trajectory, goal_handle)
@@ -265,6 +271,7 @@ class DynamicTrajectoryActionServer(StretchTrajectoryActionServer):
             if check is not None and check.stamp != gated_stamp:
                 gated_stamp = check.stamp
                 gate.update(check.stamp, stopping_for_block(check, target), blocked_anywhere(check))
+                self._held = gate.held
             up_rate = max_up_rate
             if gate.state == ResumeGate.STOPPED:
                 target = 0.0
@@ -375,7 +382,9 @@ class DynamicTrajectoryActionServer(StretchTrajectoryActionServer):
         tau, actual = self._state
         horizon, step = self.get_param("check_horizon"), self.get_param("check_step")
         end = min(plan.duration, tau + horizon)
-        taus = list(np.arange(tau + step, end, step)) + [end]
+        taus = (check_times(tau, end, step, self.get_param("creep_check_step"),
+                            tau + self.get_param("creep_check_fine_horizon"))
+                if self._held else check_times(tau, end, step))
         if end - tau < 1e-6:
             return CheckResult(starts=np.array([tau]), ends=np.array([plan.duration]), caps=np.array([1.0]),
                                stamp=time.monotonic())

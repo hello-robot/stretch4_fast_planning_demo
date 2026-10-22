@@ -143,6 +143,21 @@ def blocked_anywhere(check):
     return bool(np.any(check.caps == 0.0))
 
 
+def check_times(tau, end, step, fine_step=None, fine_until=None):
+    """Segment ends (trajectory time) for a check of the motion from tau to end: every step s,
+    or every fine_step s up to fine_until first. While creeping toward a block, fine steps
+    near the robot say more closely where the block starts, so the robot can brake for it
+    gently instead of stopping hard when it turns up in the first segment."""
+    fine_end = min(end, fine_until) if fine_step and fine_until is not None and fine_until > tau else tau
+    times = list(np.arange(tau + fine_step, fine_end - 1e-6, fine_step)) if fine_end > tau else []
+    if fine_end > tau:
+        times.append(fine_end)
+    times += list(np.arange(fine_end + step, end - 1e-6, step))
+    if not times or times[-1] < end - 1e-9:
+        times.append(end)
+    return [float(t) for t in times]
+
+
 def creep_scale(trajectory, tau0, tau1, speed, levers):
     """The scale at which no point of the robot moves faster than `speed` (m/s) over trajectory
     time [tau0, tau1], bounding the fastest point's planned speed by each joint's top speed
