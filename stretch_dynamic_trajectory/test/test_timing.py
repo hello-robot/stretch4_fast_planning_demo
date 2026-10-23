@@ -308,4 +308,8 @@ def test_rewinding_after_a_back_off_goes_to_where_the_robot_is_on_the_plan():
     assert trajectory.sample(t)[0][0] == pytest.approx(backed_off, abs=0.001)
     assert t < tau
     assert rewind(trajectory, tau, 0, trajectory.sample(tau)[0][0]) == pytest.approx(tau)
-    assert rewind(trajectory, tau, 0, -1.0) == 0.0
+    # Off the plan's travel (pushed behind where it started): carry on from tau, catching up.
+    assert rewind(trajectory, tau, 0, -1.0) == tau
+    # A joint the plan doesn't move: likewise.
+    still = Trajectory([0.0, 4.0], [[0.0, 0.5], [0.2, 0.5]])
+    assert rewind(still, tau, 1, 0.45) == tau

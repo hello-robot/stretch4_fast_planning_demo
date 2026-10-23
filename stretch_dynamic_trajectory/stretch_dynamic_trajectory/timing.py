@@ -264,15 +264,16 @@ class ResumeGate:
 
 
 def rewind(trajectory, tau, joint, position, step=0.01):
-    """The latest trajectory time at or before tau where `joint` is no further along the plan
-    than `position` (it backed off after a contact): where to carry on from."""
-    q_tau = trajectory.sample(tau)[0][joint]
+    """Where to carry on from after `joint` was moved off the plan (backed off, or pushed): the
+    latest trajectory time at or before tau where the plan has it at `position`. If the plan
+    never had it there before tau (the joint doesn't move in the plan, or was pushed past where
+    it started), tau itself: the joints then catch up with the plan slowly, as after a lag."""
     t = tau
     while t > 0.0:
-        q = trajectory.sample(t)[0][joint]
-        # Moving from q toward q_tau, the robot at `position` is at or past q.
-        if (q_tau - q) * (position - q) >= 0.0 and abs(position - q) <= abs(q_tau - q) + 1e-9:
-            return t
-        t = max(0.0, t - step)
-    return 0.0
-
+        earlier = max(0.0, t - step)
+        q0, q1 = trajectory.sample(earlier)[0][joint], trajectory.sample(t)[0][joint]
+        if min(q0, q1) - 1e-9 <= position <= max(q0, q1) + 1e-9:
+            # Between two samples: the later one is close enough.
+            return t if abs(q1 - position) <= abs(q0 - position) else earlier
+        t = earlier
+    return tau

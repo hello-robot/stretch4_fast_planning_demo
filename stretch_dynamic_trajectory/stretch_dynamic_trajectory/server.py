@@ -29,11 +29,16 @@ driver's guarded-contact sensitivity is raised (unsafe_sensitivity), and set bac
 Feetech servos sometimes keep a stale speed) is quick-stopped and the goal aborted.
 
 A rise in a moving joint's effort over its free-motion level (contact.py) means contact: the
-robot stops, the joint that touched backs off back_off_distance along its own axis at
-back_off_speed (both m at the contact point), and holds; never limp. Then contact_action:
-"abort" ends the goal, reporting the contact; "resume" goes back along the plan to where the
-robot backed off to, holds contact_hold s, and carries on (into the same thing again, if it's
-still there), ending the goal after contact_resume_limit contacts in it.
+robot stops, and the joint that touched backs off back_off_distance along its own axis at
+back_off_speed (both m at the contact point). A held arm or lift joint that's pushed (its
+effort beyond its holding band; contact.py) yields: it moves with the push, as fast as the
+push says up to yield_max_speed (0.02 m/s), until the push eases, it runs into something
+else, or it has gone yield_max_distance (0.1 m) (Elaine, 2026-10-23: not holding firm
+until the firmware guard trips and leaves it limp). After a contact or a push the plan holds
+for contact_hold s, still yielding to pushes, then contact_action: "abort" ends the goal,
+reporting what happened; "resume" goes back along the plan to where the robot is and carries
+on (into the same thing again, if it's still there), ending the goal after
+contact_resume_limit contacts and pushes in it.
 
 Not yet: replanning around a blocked path, and dodging while holding a position.
 """
@@ -55,12 +60,14 @@ from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 from hello_helpers.stretch4_ros_api import StretchTrajectoryActionServer
 from stretch_motion_planning_interfaces.srv import CheckMotion
 
-from stretch_dynamic_trajectory.contact import CONTACT_SETTINGS, ContactDetector
+from stretch_dynamic_trajectory.contact import (CONTACT_SETTINGS, YIELD_SETTINGS, ContactDetector, ContactSettings,
+                                                Yielding)
 from stretch_dynamic_trajectory.timing import (CheckResult, ResumeGate, Trajectory, blocked_anywhere, check_times,
                                                creeping_limits, rewind, scale_deceleration, segment_caps, step_scale,
                                                stopping_for_block, target_scale)
 
 WRIST_JOINTS = ("wrist_yaw_joint", "wrist_pitch_joint", "wrist_roll_joint")
+STILL_SPEED = 1e-3  # planned joint speed (units/s) under which a joint counts as held
 # m a point of the robot moves per unit of each joint's motion, at most, for bounding the
 # fastest point's speed while creeping: the robot's reach for base rotation (arm out 0.55 m plus
 # the gripper), the gripper's length for the wrist joints, and 1 for everything else.
@@ -123,16 +130,26 @@ class DynamicTrajectoryActionServer(StretchTrajectoryActionServer):
         add_param("creep_standoff", 0.05)
         # Contact (see contact.py): on a rise in a moving joint's effort, stop, back that joint
         # off back_off_distance (m at the contact point: the gripper for a wrist joint) at
-        # back_off_speed (m/s), hold, then contact_action: "abort" or "resume" (after
-        # contact_hold s).
+        # back_off_speed (m/s), hold contact_hold s (yielding to pushes), then contact_action:
+        # "abort" or "resume". contact_threshold.<joint>: effort points over the free level.
         add_param("contact_detection", True)
-        # Multiplies contact.py's effort thresholds: below 1 stops on a lighter touch.
+        for joint, settings in CONTACT_SETTINGS.items():
+            add_param(f"contact_threshold.{joint}", settings.threshold)
+        # Multiplies the contact thresholds: below 1 stops on a lighter touch.
         add_param("contact_threshold_scale", 1.0)
         add_param("contact_action", "abort")
-        add_param("back_off_distance", 0.05)
+        add_param("back_off_distance", 0.02)
         add_param("back_off_speed", 0.02)
         add_param("contact_hold", 2.0)
         add_param("contact_resume_limit", 3)
+        # Yielding to a push on a held arm or lift: yield_threshold.<joint> is effort points
+        # beyond its holding band; it moves with the push at up to yield_max_speed (m/s).
+        add_param("yield_to_pushes", True)
+        for joint, settings in YIELD_SETTINGS.items():
+            add_param(f"yield_threshold.{joint}", settings.threshold)
+        add_param("yield_max_speed", 0.02)
+        # A yield ends after this far (m at the contact point), whatever the effort says.
+        add_param("yield_max_distance", 0.1)
         # While held, the first creep_check_fine_horizon s of each check go in steps of
         # creep_check_step, so a block near the robot is placed closely enough to brake for gently.
         add_param("creep_check_step", 0.02)
@@ -291,14 +308,15 @@ class DynamicTrajectoryActionServer(StretchTrajectoryActionServer):
         levers = np.array([CREEP_LEVERS.get(j, 1.0) for j in joints])
         check_timeout = self.get_param("check_timeout")
         max_lag = self.get_param("max_lag_tolerances")
-        threshold_scale = self.get_param("contact_threshold_scale")
-        detectors = ({i: ContactDetector(CONTACT_SETTINGS[j], threshold_scale=threshold_scale)
-                      for i, j in enumerate(joints) if j in CONTACT_SETTINGS}
-                     if self.get_param("contact_detection") else {})
+        detectors, yielders = self._contact_watchers(joints, levers)
         commands = np.zeros(len(joints))  # last loop's, which the efforts now respond to
-        hold_until = None  # after a contact, with contact_action "resume"
+        feedforward = np.zeros(len(joints))  # last loop's planned motion: zero for held joints
+        hold_until = None  # the plan holds until then after a contact or a push
+        pending = None  # (joint index, what happened) after a contact or a push, until hold_until
+        yielding = None  # the joint index moving with a push
+        yield_from = 0.0  # where it started
         contact = 0.0  # the last contact's effort rise, for the timing topic
-        contacts = 0
+        contacts = 0  # contacts and pushes in this goal
         catch_up_fraction, catch_up_floor = self.get_param("catch_up_fraction"), self.get_param("catch_up_floor")
 
         tau, scale = 0.0, 0.0
@@ -333,21 +351,73 @@ class DynamicTrajectoryActionServer(StretchTrajectoryActionServer):
             scale = step_scale(scale, target, rate_limit, dt, up_rate=up_rate)
 
             actual = self._positions(joints)
-            touched = self._detect_contact(detectors, joints, commands, now)
+            efforts = {i: self._joint_effort(joints[i]) for i in set(detectors) | set(yielders)}
+
+            # Moving with a push: nothing else moves until it eases.
+            if yielding is not None:
+                effort = efforts.get(yielding)
+                velocity = yielders[yielding].update(now, effort) if effort is not None else 0.0
+                if abs(actual[yielding] - yield_from) >= self.get_param("yield_max_distance") / levers[yielding]:
+                    self.driver.get_logger().warn(f"{joints[yielding]}: yielded yield_max_distance; holding")
+                    yielders[yielding].stop()
+                    velocity = 0.0
+                commands = np.zeros(len(joints))
+                commands[yielding] = velocity
+                with self._server_commands():
+                    for k, joint in enumerate(joints):
+                        self._command_velocity(joint, commands[k])
+                if not yielders[yielding].active:
+                    self.driver.get_logger().info(f"{joints[yielding]}: the push eased; holding")
+                    yielding, hold_until = None, now + self.get_param("contact_hold")
+                scale = 0.0
+                self._publish(goal_handle, joints, tau, scale, 0.0, check, now, plan.sample(tau)[0], actual,
+                              commands, start, gate.state, contact)
+                rate.sleep()
+                continue
+
+            # Running into something: back off, then hold (yielding to pushes).
+            touched = self._detect_contact(detectors, commands, efforts, now)
             if touched is not None:
                 i, rise = touched
                 contact, contacts = rise, contacts + 1
                 backed_off = self._back_off(joints, i, commands[i], levers[i], goal_handle, rate)
-                if self.get_param("contact_action") != "resume" or contacts >= self.get_param("contact_resume_limit"):
-                    return self._abort(goal_handle, FollowJointTrajectory.Result.PATH_TOLERANCE_VIOLATED,
-                                       f"contact on {joints[i]} (effort {rise:.0f} over free motion); "
-                                       f"backed off {backed_off:.3f}")
-                actual = self._positions(joints)
-                tau = rewind(plan, tau, i, actual[i])
+                pending = (i, f"contact on {joints[i]} (effort {rise:.0f} over free motion); backed off {backed_off:.3f}")
                 scale, hold_until = 0.0, time.monotonic() + self.get_param("contact_hold")
-                commands = np.zeros(len(joints))
+                commands, feedforward = np.zeros(len(joints)), np.zeros(len(joints))
                 last = time.monotonic()
                 continue
+
+            # Pushed while held: yield.
+            for i, yielder in yielders.items():
+                if abs(feedforward[i]) < STILL_SPEED and efforts.get(i) is not None and yielder.watch(now, efforts[i]):
+                    yielding, yield_from = i, actual[i]
+                    self.driver.get_logger().warn(f"{joints[i]} pushed (effort {efforts[i]:.0f}): yielding")
+                    if pending is None:
+                        contacts += 1
+                        pending = (i, f"{joints[i]} pushed")
+                    break
+            if yielding is not None:
+                continue
+
+            # After a contact or a push: hold still where it is (not back toward the plan, which
+            # would lead back into whatever it was) for contact_hold s, then end the goal or
+            # carry on.
+            if pending is not None and now < hold_until:
+                commands = np.zeros(len(joints))
+                with self._server_commands():
+                    for joint in joints:
+                        self._command_velocity(joint, 0.0)
+                scale = 0.0
+                self._publish(goal_handle, joints, tau, scale, 0.0, check, now, plan.sample(tau)[0], actual,
+                              commands, start, gate.state, contact)
+                rate.sleep()
+                continue
+            if pending is not None:
+                i, what = pending
+                pending = None
+                if self.get_param("contact_action") != "resume" or contacts >= self.get_param("contact_resume_limit"):
+                    return self._abort(goal_handle, FollowJointTrajectory.Result.PATH_TOLERANCE_VIOLATED, what)
+                tau = rewind(plan, tau, i, actual[i])
 
             # Advance along the plan more slowly the further the robot lags behind it, and not
             # at all past max_lag tolerances.
@@ -394,13 +464,31 @@ class DynamicTrajectoryActionServer(StretchTrajectoryActionServer):
         result.error_code = FollowJointTrajectory.Result.SUCCESSFUL
         return result
 
-    def _detect_contact(self, detectors, joints, commands, now):
+    def _contact_watchers(self, joints, levers):
+        """({joint index: ContactDetector}, {joint index: Yielding}) for this goal's joints, as
+        the parameters say."""
+        detectors, yielders = {}, {}
+        if self.get_param("contact_detection"):
+            scale = self.get_param("contact_threshold_scale")
+            for i, joint in enumerate(joints):
+                if joint in CONTACT_SETTINGS:
+                    threshold = self.get_param(f"contact_threshold.{joint}")
+                    settings = ContactSettings(threshold, None, CONTACT_SETTINGS[joint].signed,
+                                               CONTACT_SETTINGS[joint].start_transient)
+                    detectors[i] = ContactDetector(settings, threshold_scale=scale)
+        if self.get_param("yield_to_pushes"):
+            for i, joint in enumerate(joints):
+                if joint in YIELD_SETTINGS:
+                    yielders[i] = Yielding(YIELD_SETTINGS[joint], self.get_param("yield_max_speed") / levers[i],
+                                           self.get_param(f"yield_threshold.{joint}"))
+        return detectors, yielders
+
+    def _detect_contact(self, detectors, commands, efforts, now):
         """(joint index, effort rise) of the first joint in contact, or None."""
         for i, detector in detectors.items():
-            effort = self._joint_effort(joints[i])
-            if effort is None:
+            if efforts.get(i) is None:
                 continue
-            rise = detector.update(now, effort, commands[i])
+            rise = detector.update(now, efforts[i], commands[i])
             if rise is not None:
                 return i, rise
         return None
