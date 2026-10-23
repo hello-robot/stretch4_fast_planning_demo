@@ -80,18 +80,18 @@ def test_a_held_joint_yields_to_a_push_from_its_own_holding_level():
     # As on the robot (2026-10-23): the held arm at about -2, a firm push in raising it to 10-12.
     yielder = Yielding(ARM, max_speed=0.02)
     # Settling after a move (effort decaying from its motion value) isn't a push.
-    assert held(yielder, 0.0, 1.5, lambda t: 11.0 - 13.0 * min(1.0, t / 1.2)) is None
+    assert held(yielder, 0.0, 2.5, lambda t: 11.0 - 13.0 * min(1.0, t / 1.8)) is None
     # Slow drift isn't either.
-    assert held(yielder, 1.5, 4.0, lambda t: -2.0 + 0.5 * (t - 1.5)) is None
-    t = held(yielder, 4.0, 6.0, lambda t: -0.75 + 12.0 * min(1.0, (t - 4.0) / 0.4))
-    assert t is not None and t < 4.0 + 0.4 + 0.11 and yielder.direction == -1
+    assert held(yielder, 2.5, 5.0, lambda t: -2.0 + 0.2 * (t - 2.5)) is None
+    t = held(yielder, 5.0, 7.0, lambda t: -1.5 + 12.0 * min(1.0, (t - 5.0) / 0.4))
+    assert t is not None and t < 5.0 + 0.4 + 0.11 and yielder.direction == -1
 
 
 def test_the_hold_level_starts_over_after_moving():
     yielder = Yielding(ARM, max_speed=0.02)
-    assert held(yielder, 0.0, 2.0, 0.0) is None
+    assert held(yielder, 0.0, 3.0, 0.0) is None
     # It moved (no watch for a while), and now rests at a different level: no push.
-    assert held(yielder, 3.0, 5.0, 10.0) is None
+    assert held(yielder, 4.0, 7.0, 10.0) is None
 
 
 def test_yielding_follows_the_push_and_stops_when_it_eases():
@@ -105,7 +105,7 @@ def test_yielding_follows_the_push_and_stops_when_it_eases():
     assert -0.05 < v < 0.0 and v == pytest.approx(-ARM.gain * 4.0)
     # The push eases (the motor back at its free effort): stop yielding after release_time.
     assert yielder.update(0.2, free_in) == 0.0 and yielder.active
-    assert yielder.update(0.71, free_in) == 0.0 and not yielder.active
+    assert yielder.update(1.21, free_in) == 0.0 and not yielder.active
 
 
 def test_the_lift_yields_down_when_pushed_down_and_up_when_lifted():
@@ -120,8 +120,8 @@ def test_the_lift_yields_down_when_pushed_down_and_up_when_lifted():
 def test_after_a_yield_another_waits_for_the_push_to_let_go():
     yielder = Yielding(ARM, max_speed=0.02)
     pushed = ARM.threshold + 3.0
-    assert held(yielder, 0.0, 1.5, 0.0) is None
-    assert held(yielder, 1.5, 2.0, pushed) is not None
+    assert held(yielder, 0.0, 2.5, 0.0) is None
+    assert held(yielder, 2.5, 3.0, pushed) is not None
     yielder.stop()
     # Held again (from the hold level before the push) and never let go: no new yield.
     assert held(yielder, 3.0, 6.0, pushed) is None

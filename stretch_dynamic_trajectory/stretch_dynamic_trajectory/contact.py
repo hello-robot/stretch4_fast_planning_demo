@@ -120,7 +120,7 @@ class ContactDetector:
 # harder; pushing the lift down makes it hold up harder. So a push is effort beyond the joint's
 # own holding level by a threshold. The holding level follows the effort for settle s after the
 # joint comes to rest (it settles from its motion value: the arm's from about +11 to -2 in about
-# 1.5 s), then drifts at most hold_rate (0.3) points/s (resting effort drifts under 0.2/s),
+# 1.5 s; YieldSettings.settle), then drifts at most hold_rate (0.3) points/s (resting effort drifts under 0.2/s),
 # which a push (about 10 points in a second or less) outruns. A band between the free-motion
 # efforts doesn't work: Elaine's firm pushes on the held arm (2026-10-23) raised its effort from
 # about -2 to only 10-12, inside the band.
@@ -133,26 +133,30 @@ class ContactDetector:
 class YieldSettings:
     """How one stepper joint yields to a push. Efforts are signed, as reported."""
     free_effort: tuple      # effort moving freely (- direction, + direction): medians, 2026-10-23
-    threshold: float        # effort beyond the band between them that starts a yield
+    threshold: float        # effort beyond the holding level that starts a yield
     release: float          # push (effort points) under which yielding stops
     gain: float             # yield speed (joint units/s) per effort point of push over release
+    settle: float           # s the effort takes to settle after the joint comes to rest
 
 
 # Free-motion efforts from free_motion_session (2026-10-23, 28 moves): arm in -4.8 (-5.4..-3.9
 # p5..p95), out +9.7 (6.4..12.4); lift down +21.6 (19.3..23.6), up +39.5 (37.7..42.2).
+# Thresholds (Elaine, 2026-10-23: "crank the threshold way down"; at 8 she didn't feel the arm
+# move at all): arm 3, which caught all five of her pushes in push_arm_P1b with no false yields
+# while held untouched; lift 5. Settling: when a goal starts or a joint stops, the effort jumps
+# and then decays, the arm's for about 2 s, the lift's (27 -> 33 -> 27) for about 3 s.
 YIELD_SETTINGS = {
-    "arm_joint": YieldSettings((-4.8, 9.7), 8.0, 3.0, 0.005),
-    "lift_joint": YieldSettings((21.6, 39.5), 12.0, 4.0, 0.004),
+    "arm_joint": YieldSettings((-4.8, 9.7), 3.0, 1.5, 0.005, 2.0),
+    "lift_joint": YieldSettings((21.6, 39.5), 5.0, 1.5, 0.004, 4.0),
 }
 
 
 class Yielding:
     """Watches one held stepper joint for a push, and yields to it."""
 
-    def __init__(self, settings, max_speed, threshold=None, trigger_time=0.1, release_time=0.5, settle=1.0,
-                 hold_rate=0.3):
+    def __init__(self, settings, max_speed, threshold=None, trigger_time=0.1, release_time=1.0, hold_rate=0.3):
         self.settings = settings
-        self.settle = settle
+        self.settle = settings.settle
         self.hold_rate = hold_rate
         self.hold_level = None  # the holding effort
         self._held_since = self._last_watch = None
