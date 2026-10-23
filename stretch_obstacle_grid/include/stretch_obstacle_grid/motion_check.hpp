@@ -135,6 +135,10 @@ public:
   // that only needs to know whether a motion is clear.
   int first_blocked(const ObstacleGrid & grid, const std::vector<SelfModel> & samples, float theta_slack = 0.0f) const;
 
+  // True if the robot posed as `body` is already as close to an obstacle as check() calls
+  // blocked (a start or goal a planner can't use).
+  bool blocked_at(const ObstacleGrid & grid, const SelfModel & body, float theta_slack = 0.0f) const;
+
   // The voxels behind step `step` of check(grid, samples, ..., theta_slack) being blocked
   // (kObstacles) or unsafe (kUnsafe): for each moving piece with clearance 0, the flagged
   // voxels both its bounds hold (see StepHit::in_both), grown by the smallest distance the

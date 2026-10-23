@@ -49,7 +49,7 @@ install(TARGETS ${PROJECT_NAME}_core EXPORT export_${PROJECT_NAME} ARCHIVE DESTI
 # replay with timing and pictures, an RViz view, and LiDAR calibration.
 install(PROGRAMS tools/obstacle_monitor_node.py tools/replay_bag.py tools/grid_viz_node.py tools/calibrate_lidars.py
   DESTINATION lib/${PROJECT_NAME})
-install(FILES tools/grid_setup.py tools/check_viz.py DESTINATION lib/${PROJECT_NAME})
+install(FILES tools/grid_setup.py tools/check_viz.py tools/grid_planning.py DESTINATION lib/${PROJECT_NAME})
 install(DIRECTORY rviz DESTINATION share/${PROJECT_NAME})
 
 if(BUILD_TESTING)

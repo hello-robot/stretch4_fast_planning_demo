@@ -227,6 +227,11 @@ PYBIND11_MODULE(stretch_obstacle_grid, m)
       }
       return out;
     }, py::arg("voxels"), "Per voxel: bit i set if LiDAR i's latest frame has a non-robot return in it.")
+  .def("set_labels", [](ObstacleGrid & g, py::array_t<uint8_t, py::array::c_style | py::array::forcecast> labels) {
+      std::vector<uint8_t> values(labels.data(), labels.data() + labels.size());
+      py::gil_scoped_release release;
+      g.set_labels(values);
+    }, py::arg("labels"), "Labels from elsewhere (one per voxel) instead of LiDAR frames; rebuilds the tables.")
   .def("count_occupied", &ObstacleGrid::count_occupied, py::arg("box"))
   .def("count_unsafe", &ObstacleGrid::count_unsafe, py::arg("box"))
   .def("oldest_stamp", &ObstacleGrid::oldest_stamp)
@@ -325,6 +330,11 @@ PYBIND11_MODULE(stretch_obstacle_grid, m)
       return c.first_blocked(grid, samples, theta_slack);
     }, py::arg("grid"), py::arg("samples"), py::arg("theta_slack") = 0.0f,
     "The first step check() would call blocked, or -1 (without clearances or speeds).")
+  .def("blocked_at", [](const MotionCheck & c, const ObstacleGrid & grid, const SelfModel & body, float theta_slack) {
+      py::gil_scoped_release release;
+      return c.blocked_at(grid, body, theta_slack);
+    }, py::arg("grid"), py::arg("body"), py::arg("theta_slack") = 0.0f,
+    "True if the robot posed as `body` is as close to an obstacle as check() calls blocked.")
   .def("step_hits", [](const MotionCheck & c, const ObstacleGrid & grid, const std::vector<SelfModel> & samples,
     size_t step, HitKind kind, float theta_slack) {
       py::gil_scoped_release release;

@@ -8,8 +8,8 @@ Paths from the template and RRT stages are shortened by skipping any waypoints t
 straight line can go around. No ROS imports.
 
 Obstacles beyond the robot itself come in through an optional `obstacles` hook, an object
-with motion_clear(a, b) (the straight line from a to b is clear of them) and path_time(path)
-(predicted execution time of a path, s; the obstacle grid's is
+with motion_clear(a, b) (the straight line from a to b is clear of them), blocked_at(q) (q is
+already touching one) and path_time(path) (predicted execution time of a path, s; the obstacle grid's is
 stretch_obstacle_grid/tools/grid_planning.py). plan() returns the first path found;
 plan_best() gathers several and returns the one path_time says is fastest.
 """
@@ -109,6 +109,10 @@ class StretchPlanner:
             return result(False, f"Goal moves joints that are locked: {moved}")
         if self.collision.in_collision(goal):
             return result(False, f"Goal is {self._describe_invalid(goal)}")
+        if self.obstacles is not None:
+            for name, q in (("Start", start), ("Goal", goal)):
+                if self.obstacles.blocked_at(q):
+                    return result(False, f"{name} is touching an obstacle")
 
         # A start inside the padding but not touching anything gets a short move out first.
         prefix = []

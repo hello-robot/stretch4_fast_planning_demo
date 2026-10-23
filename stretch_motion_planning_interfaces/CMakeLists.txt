@@ -12,6 +12,7 @@ find_package(trajectory_msgs REQUIRED)
 rosidl_generate_interfaces(${PROJECT_NAME}
   "srv/PlanJointTrajectory.srv"
   "srv/CheckMotion.srv"
+  "srv/GetGrid.srv"
   DEPENDENCIES builtin_interfaces geometry_msgs sensor_msgs shape_msgs trajectory_msgs
 )
 

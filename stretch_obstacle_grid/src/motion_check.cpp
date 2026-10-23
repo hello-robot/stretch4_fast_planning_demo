@@ -437,6 +437,22 @@ int MotionCheck::first_blocked(
   return -1;
 }
 
+bool MotionCheck::blocked_at(const ObstacleGrid & grid, const SelfModel & body, float theta_slack) const
+{
+  float smallest = limits_.max_clearance;
+  while (smallest > limits_.clearance_resolution) {
+    smallest *= 0.5f;
+  }
+  const std::vector<Eigen::Vector3i> cuts = piece_cuts({body}, limits_.max_piece);
+  for (const Piece & piece : sample_pieces(body, cuts)) {
+    const SweptPiece still = sweep(piece, piece, 0.0f, theta_slack);
+    if (!still.clear(grid.occupied_table(), grid.occupied_box_table(), smallest)) {
+      return true;
+    }
+  }
+  return false;
+}
+
 std::vector<StepHit> MotionCheck::step_hits(
   const ObstacleGrid & grid, const std::vector<SelfModel> & samples, size_t step, HitKind kind,
   float theta_slack) const

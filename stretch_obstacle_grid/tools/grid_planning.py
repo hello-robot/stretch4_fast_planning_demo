@@ -16,10 +16,16 @@ robot's planning body, through MotionCheck.
 
 Configurations are planner order (base rotation relative to base_footprint now, lift, arm,
 wrist yaw, pitch, roll), as the monitor's check_motion uses.
+
+Off the robot, the planner plans against a snapshot of the monitor's grid (its get_grid
+service): encode_snapshot / decode_snapshot carry the three layers the checks use (obstacles,
+the moving ones, unsafe space), cropped to the voxels within reach (crop_voxels), about 35 KB
+compressed; a grid made with no LiDARs takes them with set_labels.
 """
 
 import math
 import time
+import zlib
 
 import numpy as np
 
@@ -93,6 +99,10 @@ class GridObstacles:
         self.stats["check_s"] += time.perf_counter() - t1
         return blocked < 0
 
+    def blocked_at(self, q):
+        """True if configuration q is already as close to an obstacle as a step's blocked."""
+        return self.checker.blocked_at(self.grid, self._body(q), self.theta_slack)
+
     def path_time(self, path):
         """Predicted execution time (s) of a path of waypoints: per step, the larger of its
         nominal time and MotionCheck's minimum. Infinite if any step is blocked."""
@@ -105,3 +115,41 @@ class GridObstacles:
                 nominal = float(np.max(np.abs(q1 - q0) / self.max_velocity))
                 total += max(nominal, step.min_duration)
         return total
+
+
+# --- Grid snapshots ---------------------------------------------------------------------------
+
+OBSTACLE_LABELS = (int(og.OCCUPIED), int(og.STATIC))
+UNSAFE_LABELS = (int(og.UNKNOWN), int(og.CONTAMINATED_SHADOW))
+
+
+def crop_voxels(grid, r_max):
+    """How many of the grid's voxels (an og.CylindricalGrid; they're ordered by radial bin
+    first) lie in radial bins starting within r_max of the axis."""
+    config = grid.config
+    first_outside = int(np.clip(np.ceil((r_max - config.r_min) / config.cell), 0, grid.radial_bins))
+    return grid.size if first_outside >= grid.radial_bins else int(grid.index(first_outside, 0, 0))
+
+
+def encode_snapshot(labels, voxels):
+    """The first `voxels` labels as zlib-compressed bit layers: obstacles, moving obstacles,
+    unsafe space."""
+    labels = np.asarray(labels)[:voxels]
+    layers = (np.isin(labels, OBSTACLE_LABELS), labels == int(og.OCCUPIED), np.isin(labels, UNSAFE_LABELS))
+    return zlib.compress(b"".join(np.packbits(layer).tobytes() for layer in layers), 1)
+
+
+def decode_snapshot(data, voxels, size):
+    """Labels for a whole grid of `size` voxels from encode_snapshot's bytes: occupied, static,
+    unknown (for all unsafe space) or free; voxels past the crop unknown."""
+    bits = np.unpackbits(np.frombuffer(zlib.decompress(data), dtype=np.uint8))
+    stride = (voxels + 7) // 8 * 8
+    obstacle, moving, unsafe = (bits[k * stride:k * stride + voxels].astype(bool) for k in range(3))
+    labels = np.full(size, int(og.UNKNOWN), dtype=np.uint8)
+    head = np.full(voxels, int(og.FREE), dtype=np.uint8)
+    head[unsafe] = int(og.UNKNOWN)
+    head[obstacle] = int(og.STATIC)
+    head[moving] = int(og.OCCUPIED)
+    labels[:voxels] = head
+    return labels
+

@@ -512,6 +512,21 @@ void ObstacleGrid::update(const SelfModel & self, const Eigen::Isometry3f & worl
   timing_.contaminate = ms_since(start);
 
   start = Clock::now();
+  build_tables();
+  timing_.tables = ms_since(start);
+}
+
+void ObstacleGrid::set_labels(const std::vector<uint8_t> & labels)
+{
+  if (labels.size() != labels_.size()) {
+    throw std::invalid_argument("ObstacleGrid::set_labels: one label per voxel");
+  }
+  labels_ = labels;
+  build_tables();
+}
+
+void ObstacleGrid::build_tables()
+{
   const uint32_t obstacles = (1u << kOccupied) | (1u << kStatic), moving = 1u << kOccupied;
   const uint32_t unsafe = (1u << kUnknown) | (1u << kContaminatedShadow);
   occupied_table_.build(labels_, obstacles, params_.table_threads);
@@ -526,7 +541,6 @@ void ObstacleGrid::update(const SelfModel & self, const Eigen::Isometry3f & worl
     #pragma omp section
     unsafe_box_table_.build(labels_, unsafe);
   }
-  timing_.tables = ms_since(start);
 }
 
 }  // namespace stretch_obstacle_grid

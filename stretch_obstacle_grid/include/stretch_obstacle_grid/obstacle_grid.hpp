@@ -161,6 +161,9 @@ public:
   void update(const SelfModel & self, const Eigen::Isometry3f & world_from_base = Eigen::Isometry3f::Identity());
 
   const std::vector<uint8_t> & labels() const {return labels_;}
+  // Take the labels from elsewhere instead of from LiDAR frames (a snapshot of another grid's,
+  // to plan against off the robot; a grid made with no LiDARs), and rebuild the tables.
+  void set_labels(const std::vector<uint8_t> & labels);
   // Bit i set if LiDAR i's latest frame (as of the last update) has a return from something
   // other than the robot in the voxel.
   uint8_t seen_by(size_t voxel) const {return occupied_by_[voxel];}
@@ -194,6 +197,7 @@ private:
   Label label_voxel(size_t voxel) const;
   void mark_static_obstacles(const Eigen::Isometry3f & world_from_base);
   void contaminate_shadows();
+  void build_tables();
   bool is_self(const SelfModel & moving, const Eigen::Vector3f & p) const;
   void drop_small_clusters(
     const float * xyz, const Eigen::Isometry3f & base_from_lidar, const SelfModel & self, int rows, int cols);

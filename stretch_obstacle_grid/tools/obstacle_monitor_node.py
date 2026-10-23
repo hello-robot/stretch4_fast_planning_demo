@@ -10,6 +10,8 @@ the LiDAR mounts.
 
 Outputs:
   check_motion (stretch_motion_planning_interfaces/CheckMotion)
+  get_grid (stretch_motion_planning_interfaces/GetGrid): a snapshot of the grid to plan
+      against off the robot (grid_planning.py), cropped to planning_reach (1.15 m), about 35 KB
   obstacle_grid/timing (diagnostic_msgs/DiagnosticArray, every report_period s): how long each
       step takes, from the end of a LiDAR sweep to the grid being ready, and per check
   obstacle_grid/{occupied,static,shadow,contaminated} with publish_labels, as grid_viz_node.py
@@ -75,12 +77,13 @@ from trajectory_msgs.msg import JointTrajectory
 from visualization_msgs.msg import MarkerArray
 
 import check_viz
+import grid_planning
 import stretch_obstacle_grid as og
 from grid_setup import (GRID_FRAME, LIDARS, RobotShapes, cloud_fields, joint_vector, load_calibration,
                         load_ring_elevations, make_grid, odom_pose, step_braking, transform_matrix)
 from grid_viz_node import PUBLISHED_LABELS, xyz_cloud
 from stretch_motion_planning.collision_model import JOINT_NAMES
-from stretch_motion_planning_interfaces.srv import CheckMotion
+from stretch_motion_planning_interfaces.srv import CheckMotion, GetGrid
 
 FRAME_DURATION = 0.1  # s per LiDAR sweep
 # Only the newest frame: an old one is worth less than the time it takes.
@@ -134,6 +137,7 @@ class ObstacleMonitor(Node):
         self.publish_checks = self.declare_parameter("publish_checks", True).value
         self.fade_time = self.declare_parameter("fade_time", 0.5).value
         self.plan_fade_time = self.declare_parameter("plan_fade_time", 10.0).value
+        self.planning_reach = self.declare_parameter("planning_reach", 1.15).value
         report_period = self.declare_parameter("report_period", 5.0).value
         calibration_file = self.declare_parameter("calibration_file", "").value
         ring_file = self.declare_parameter("ring_elevations_file", "").value
@@ -178,6 +182,7 @@ class ObstacleMonitor(Node):
                                      NEWEST_FRAME_ONLY, callback_group=clouds)
         self.create_service(CheckMotion, "check_motion", self.check_motion,
                             callback_group=MutuallyExclusiveCallbackGroup())
+        self.create_service(GetGrid, "get_grid", self.get_grid, callback_group=MutuallyExclusiveCallbackGroup())
         self.timing_pub = self.create_publisher(DiagnosticArray, "obstacle_grid/timing", 1)
         self.label_pubs = {name: self.create_publisher(PointCloud2, f"obstacle_grid/{name}", 1)
                            for name in DEBUG_LABELS} if self.publish_labels else {}
@@ -387,6 +392,29 @@ class ObstacleMonitor(Node):
         if drawn is not None:
             self.stats.add(check_hits=hits_done - checked)
             self.drawn_checks.append(drawn)
+        return response
+
+    def get_grid(self, request, response):
+        """A snapshot of the labels for a planner off the robot (grid_planning.py)."""
+        if self.grid is None:
+            response.success, response.message = False, "the grid isn't ready yet"
+            return response
+        start = time.perf_counter()
+        r_max = request.r_max if request.r_max > 0.0 else self.planning_reach
+        voxels = grid_planning.crop_voxels(self.grid.grid, r_max)
+        with self.lock:
+            labels = self.grid.labels()
+            oldest = self.grid.oldest_stamp()
+        config = self.grid.grid.config
+        response.success = True
+        response.grid_stamp = Time(seconds=oldest).to_msg()
+        response.heading = self.heading_at(oldest)
+        response.cell, response.grid_r_min, response.grid_r_max = config.cell, config.r_min, config.r_max
+        response.z_min, response.z_max = config.z_min, config.z_max
+        response.voxels = voxels
+        response.layers = grid_planning.encode_snapshot(labels, voxels)
+        response.message = f"{voxels} voxels, {len(response.layers)} bytes"
+        self.stats.add(get_grid=time.perf_counter() - start)
         return response
 
     # --- check markers -----------------------------------------------------------------------

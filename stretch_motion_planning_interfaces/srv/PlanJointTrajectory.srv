@@ -21,6 +21,11 @@ geometry_msgs/Pose[] obstacle_poses
 # Also avoid the collision objects in MoveIt's planning scene (/get_planning_scene).
 bool use_planning_scene
 
+# Also avoid the obstacle monitor's grid (fetched from its get_grid service), with paths
+# chosen by predicted time: obstacles block, unknown space and contaminated shadow only slow
+# the robot down.
+bool use_obstacle_grid
+
 # Seconds to search before giving up; 0 uses the node's default.
 float64 timeout
 ---

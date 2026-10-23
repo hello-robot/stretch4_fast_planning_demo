@@ -1067,3 +1067,35 @@ TEST(MotionCheck, FirstBlockedAgreesWithCheck)
   EXPECT_EQ(checker.first_blocked(*labeled, clear), -1);
 }
 
+TEST(ObstacleGrid, SetLabelsGivesTheSameChecks)
+{
+  // A grid made with no LiDARs, given another grid's labels, checks motion the same way.
+  Scene scene;
+  scene.obstacles.emplace_back(Eigen::Vector3f(1.0f, -0.1f, 0.0f), Eigen::Vector3f(1.1f, 0.1f, 1.0f));
+  const auto labeled = label_scene(scene);
+  ObstacleGrid copy(labeled->grid().config(), {});
+  copy.set_labels(labeled->labels());
+  std::vector<SelfModel> samples;
+  for (int i = 0; i <= 55; ++i) {samples.push_back(arm_at(scene, 0.01f * i));}
+  const MotionCheck checker;
+  const auto a = checker.check(*labeled, samples);
+  const auto b = checker.check(copy, samples);
+  ASSERT_EQ(a.size(), b.size());
+  for (size_t k = 0; k < a.size(); ++k) {
+    EXPECT_EQ(a[k].blocked, b[k].blocked);
+    EXPECT_EQ(a[k].unsafe, b[k].unsafe);
+    EXPECT_FLOAT_EQ(a[k].min_duration, b[k].min_duration);
+  }
+  EXPECT_THROW(copy.set_labels(std::vector<uint8_t>(3)), std::invalid_argument);
+}
+
+TEST(MotionCheck, BlockedAtAPoseTouchingAnObstacle)
+{
+  Scene scene;
+  scene.obstacles.emplace_back(Eigen::Vector3f(1.0f, -0.1f, 0.0f), Eigen::Vector3f(1.1f, 0.1f, 1.0f));
+  const auto labeled = label_scene(scene);
+  const MotionCheck checker;
+  EXPECT_FALSE(checker.blocked_at(*labeled, arm_at(scene, 0.0f)));   // front face 0.5 m short of the post
+  EXPECT_TRUE(checker.blocked_at(*labeled, arm_at(scene, 0.55f)));   // into it
+}
+
