@@ -6,6 +6,12 @@ Tries three stages, fastest first, and returns the first path found:
   3. rrt:      RRT-Connect, for anything the first two can't do
 Paths from the template and RRT stages are shortened by skipping any waypoints that a
 straight line can go around. No ROS imports.
+
+Obstacles beyond the robot itself come in through an optional `obstacles` hook, an object
+with motion_clear(a, b) (the straight line from a to b is clear of them) and path_time(path)
+(predicted execution time of a path, s; the obstacle grid's is
+stretch_obstacle_grid/tools/grid_planning.py). plan() returns the first path found;
+plan_best() gathers several and returns the one path_time says is fastest.
 """
 
 import math
@@ -30,8 +36,9 @@ class PlanResult:
 
 
 class StretchPlanner:
-    def __init__(self, collision_model, config, seed=None):
+    def __init__(self, collision_model, config, seed=None, obstacles=None):
         self.collision = collision_model
+        self.obstacles = obstacles
         planner_config = config["planner"]
         self.resolution = joint_vector(planner_config["check_resolution"])
         self.weights = joint_vector(planner_config["distance_weights"])
@@ -52,7 +59,7 @@ class StretchPlanner:
         for i in range(1, steps + 1):
             if self.collision.in_collision(a + (b - a) * (i / steps), padding):
                 return False
-        return True
+        return self.obstacles is None or self.obstacles.motion_clear(a, b)
 
     def _escape_padding(self, start, active):
         """A configuration near `start` that clears the padding, reachable from `start`
@@ -128,6 +135,42 @@ class StretchPlanner:
         if path is None:
             return result(False, f"No path found within {timeout:.2f} s")
         return found("rrt", "RRT-Connect path", self.shortcut(path))
+
+    def plan_best(self, start, goal, active=None, timeout=None, rrt_runs=3):
+        """Like plan(), but gathers the direct path, every valid template path and up to
+        rrt_runs RRT-Connect paths (within timeout), shortcut, and returns the one with the
+        least predicted time (obstacles.path_time, or the nominal time at the joints' top
+        speeds without obstacles)."""
+        first = self.plan(start, goal, active, timeout)
+        if not first.success or first.method == "direct":
+            return first  # a straight line is as good as it gets
+        t0 = time.perf_counter() - first.planning_time
+        timeout = self.default_timeout if not timeout else timeout
+        active = np.ones(len(JOINT_NAMES), bool) if active is None else np.asarray(active, bool)
+        start = first.path[0]
+        candidates = [(first.method, first.path)]
+        for path in self._template_paths(start, np.asarray(goal, dtype=float), active):
+            if self.path_valid(path):
+                candidates.append(("template", self.shortcut(path)))
+        for _ in range(rrt_runs):
+            remaining = t0 + timeout - time.perf_counter()
+            if remaining <= 0.0:
+                break
+            path = self._rrt_connect(start, np.asarray(goal, dtype=float), active, time.perf_counter() + remaining)
+            if path is not None:
+                candidates.append(("rrt", self.shortcut(path)))
+        times = [self.path_time(path) for _, path in candidates]
+        k = int(np.argmin(times))
+        method, path = candidates[k]
+        return PlanResult(True, f"Fastest of {len(candidates)} candidates ({times[k]:.2f} s predicted)", method,
+                          [np.array(q) for q in path], time.perf_counter() - t0)
+
+    def path_time(self, path):
+        """Predicted time (s): the obstacles hook's, or the slowest joint's change at a nominal
+        1 unit/s per weight (the RRT's metric) without one."""
+        if self.obstacles is not None:
+            return self.obstacles.path_time(path)
+        return float(sum(np.max(np.abs(self.weights * (b - a))) for a, b in zip(path[:-1], path[1:])))
 
     def _template_paths(self, start, goal, active):
         """Candidate paths that move one group of joints at a time through the stow pose:

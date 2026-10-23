@@ -130,6 +130,11 @@ public:
     const ObstacleGrid & grid, const std::vector<SelfModel> & samples, float age = 0.0f,
     float theta_slack = 0.0f, const std::vector<float> & braking = {}) const;
 
+  // The first step check(grid, samples, ..., theta_slack) would call blocked, or -1: the same
+  // test, without the clearances and speeds, stopping at the first blocked step. For a planner
+  // that only needs to know whether a motion is clear.
+  int first_blocked(const ObstacleGrid & grid, const std::vector<SelfModel> & samples, float theta_slack = 0.0f) const;
+
   // The voxels behind step `step` of check(grid, samples, ..., theta_slack) being blocked
   // (kObstacles) or unsafe (kUnsafe): for each moving piece with clearance 0, the flagged
   // voxels both its bounds hold (see StepHit::in_both), grown by the smallest distance the

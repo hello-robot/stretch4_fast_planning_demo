@@ -319,6 +319,12 @@ PYBIND11_MODULE(stretch_obstacle_grid, m)
     }, py::arg("grid"), py::arg("samples"), py::arg("age") = 0.0f, py::arg("theta_slack") = 0.0f,
     py::arg("braking") = std::vector<float>(),
     "Limits for each step between consecutive posed bodies (SelfModels) along a motion.")
+  .def("first_blocked", [](const MotionCheck & c, const ObstacleGrid & grid, const std::vector<SelfModel> & samples,
+    float theta_slack) {
+      py::gil_scoped_release release;
+      return c.first_blocked(grid, samples, theta_slack);
+    }, py::arg("grid"), py::arg("samples"), py::arg("theta_slack") = 0.0f,
+    "The first step check() would call blocked, or -1 (without clearances or speeds).")
   .def("step_hits", [](const MotionCheck & c, const ObstacleGrid & grid, const std::vector<SelfModel> & samples,
     size_t step, HitKind kind, float theta_slack) {
       py::gil_scoped_release release;

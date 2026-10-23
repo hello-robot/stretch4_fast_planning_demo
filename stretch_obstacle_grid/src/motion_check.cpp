@@ -405,6 +405,38 @@ std::vector<StepLimit> MotionCheck::check(
   return steps;
 }
 
+int MotionCheck::first_blocked(
+  const ObstacleGrid & grid, const std::vector<SelfModel> & samples, float theta_slack) const
+{
+  if (samples.size() < 2) {
+    return -1;
+  }
+  // check() calls a step blocked when search_clearance returns 0, i.e. when every distance its
+  // bisection tries fails; clear(d) only gets harder as d grows, so that's when the smallest
+  // distance it would try fails.
+  float smallest = limits_.max_clearance;
+  while (smallest > limits_.clearance_resolution) {
+    smallest *= 0.5f;
+  }
+  const std::vector<Eigen::Vector3i> cuts = piece_cuts(samples, limits_.max_piece);
+  std::vector<Piece> a = sample_pieces(samples[0], cuts);
+  for (size_t k = 0; k + 1 < samples.size(); ++k) {
+    std::vector<Piece> b = sample_pieces(samples[k + 1], cuts);
+    for (size_t p = 0; p < a.size(); ++p) {
+      const float travel = piece_travel(a[p], b[p]);
+      if (travel < limits_.min_motion) {
+        continue;
+      }
+      const SweptPiece swept = sweep(a[p], b[p], travel, theta_slack);
+      if (!swept.clear(grid.occupied_table(), grid.occupied_box_table(), smallest)) {
+        return static_cast<int>(k);
+      }
+    }
+    a = std::move(b);
+  }
+  return -1;
+}
+
 std::vector<StepHit> MotionCheck::step_hits(
   const ObstacleGrid & grid, const std::vector<SelfModel> & samples, size_t step, HitKind kind,
   float theta_slack) const

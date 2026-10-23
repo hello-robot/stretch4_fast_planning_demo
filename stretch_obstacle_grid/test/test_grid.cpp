@@ -1046,3 +1046,24 @@ TEST(MotionCheck, StepHitsAreTheVoxelsBehindABlock)
   EXPECT_TRUE(any_in_both);
   for (size_t k = 1; k < hits.size(); ++k) {EXPECT_LT(hits[k - 1].voxel, hits[k].voxel);}
 }
+
+TEST(MotionCheck, FirstBlockedAgreesWithCheck)
+{
+  Scene scene;
+  scene.obstacles.emplace_back(Eigen::Vector3f(1.0f, -0.1f, 0.0f), Eigen::Vector3f(1.1f, 0.1f, 1.0f));
+  const auto labeled = label_scene(scene);
+  std::vector<SelfModel> samples;
+  for (int i = 0; i <= 55; ++i) {samples.push_back(arm_at(scene, 0.01f * i));}
+  const MotionCheck checker;
+  const std::vector<StepLimit> steps = checker.check(*labeled, samples);
+  int expected = -1;
+  for (size_t k = 0; k < steps.size(); ++k) {
+    if (steps[k].blocked) {expected = static_cast<int>(k); break;}
+  }
+  ASSERT_NE(expected, -1);
+  EXPECT_EQ(checker.first_blocked(*labeled, samples), expected);
+  // Short of the post, nothing is blocked.
+  const std::vector<SelfModel> clear(samples.begin(), samples.begin() + expected);
+  EXPECT_EQ(checker.first_blocked(*labeled, clear), -1);
+}
+

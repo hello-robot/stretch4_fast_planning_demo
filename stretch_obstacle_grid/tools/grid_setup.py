@@ -356,6 +356,61 @@ class RobotShapes:
         return shapes, arm_height
 
 
+class FastPlanningBody:
+    """RobotShapes.planning_body for many configurations, about 10x faster, for planning.
+
+    Every shape of the planning body is a box that moves rigidly with one of the model's joints
+    (geometry object parentJoint), except that the arm's two boxes stretch with the arm's
+    extension: their sizes and offsets are affine in it. So the body is posed once at two
+    extensions, each box's transform from its joint and its half sizes are kept as affine in the
+    extension, and a configuration then takes one forward kinematics call and a matrix product
+    per box. The gripper box fits the fingers as they were when this was made (set_fingers)."""
+
+    GEOMETRY_OF = {"arm_base": "arm", "camera_box": "wrist_roll", "gripper_box": "gripper"}
+
+    def __init__(self, robot, extensions=(0.0, 0.5)):
+        import pinocchio as pin
+        self._pin = pin
+        model = robot.model
+        self.model, self.data = model.model, model.model.createData()
+        parents = {obj.name: obj.parentJoint for obj in model.geometry.geometryObjects}
+        names = robot.shape_names()
+        self.joints = [parents[self.GEOMETRY_OF.get(n, n)] for n in names]
+        e0, e1 = extensions
+        q0, q1 = np.zeros(self.model.nq), np.zeros(self.model.nq)
+        q0[2], q1[2] = e0, e1
+        rel0, half0 = self._relative(robot, q0)
+        rel1, half1 = self._relative(robot, q1)
+        if not all(np.allclose(a[:3, :3], b[:3, :3], atol=1e-6) for a, b in zip(rel0, rel1)):
+            raise ValueError("FastPlanningBody: a box turns with the arm's extension")
+        self.e0 = e0
+        self.rel0, self.half0 = np.array(rel0), np.array(half0)
+        self.d_offset = (np.array(rel1)[:, :3, 3] - self.rel0[:, :3, 3]) / (e1 - e0)
+        self.d_half = (np.array(half1) - self.half0) / (e1 - e0)
+
+    def _relative(self, robot, q):
+        """Each box's transform from its joint, and its half sizes, at q."""
+        self._pin.forwardKinematics(self.model, self.data, q)
+        rel, half = [], []
+        for shape, joint in zip(robot.planning_body(q).shapes(), self.joints):
+            rel.append(np.linalg.inv(self.data.oMi[joint].homogeneous) @ np.asarray(shape.pose, dtype=float))
+            half.append(np.asarray(shape.dims, dtype=float))
+        return rel, half
+
+    def __call__(self, q):
+        """og.SelfModel of the planning body at q (planner order, as planning_body)."""
+        q = np.asarray(q, dtype=float)
+        self._pin.forwardKinematics(self.model, self.data, q)
+        de = q[2] - self.e0
+        shapes = []
+        for k, joint in enumerate(self.joints):
+            rel = self.rel0[k].copy()
+            rel[:3, 3] += self.d_offset[k] * de
+            pose = self.data.oMi[joint].homogeneous @ rel
+            shapes.append(og.SelfShape.box(pose.astype(np.float32), (self.half0[k] + self.d_half[k] * de).astype(np.float32)))
+        return og.SelfModel(shapes)
+
+
 def _arm_base_box(arm_placement, extension, arm_length):
     """The arm box as it is fully retracted (arm_l0, the first segment): the extending box is
     stretched along its +x by the extension, keeping its back face."""
