@@ -18,8 +18,9 @@ max_scale_up_rate. Each check's details (which
 segment and shape limit the motion, clearances, blocked segments) are published on
 dynamic_trajectory_server_diagnostics/check, and the path being followed on
 dynamic_trajectory_server_diagnostics/plan (JointTrajectory, latched) every time it changes:
-for now once per goal, and later on every replan. Its stamp is when its base rotation is
-measured from (the base's heading then is 0). The obstacle monitor draws it in RViz. Joints are commanded in velocity mode, like
+at the goal's start and on every switch to a detour. Its base rotation is measured from the
+base's heading at its stamp, when it was published (not the goal's start: a reader that needs
+the heading at a stamp minutes old may not have it). The obstacle monitor draws it in RViz. Joints are commanded in velocity mode, like
 the default server's adaptive_velocity mode: the scaled planned velocity plus kp times the
 position error, with the joint's maximum acceleration so the firmware follows each command.
 
@@ -119,7 +120,6 @@ class DynamicTrajectoryActionServer(StretchTrajectoryActionServer):
         self._check_lock = threading.Lock()
         self._state = None  # (FollowedPlan, tau, positions) shared with the check thread
         self._check_now = threading.Event()  # wakes the check thread (a new plan to check)
-        self._base_reference_stamp = None  # when the goal's base rotation is measured from
         self._held = False  # whether the resume gate holds the robot, for the check thread
         self._sensitivity = None
         super().__init__(driver, action_name="follow_joint_trajectory_dynamic",
@@ -277,7 +277,6 @@ class DynamicTrajectoryActionServer(StretchTrajectoryActionServer):
             self.direct_command_preempted = False
             self.preempted_joints = set()
             plan = FollowedPlan(self._plan(trajectory))
-            self._base_reference_stamp = self.driver.get_clock().now().to_msg()
             self._publish_plan(plan.trajectory, joints)
             with self._check_lock:
                 self._check = None
@@ -336,12 +335,15 @@ class DynamicTrajectoryActionServer(StretchTrajectoryActionServer):
 
     def _publish_plan(self, plan, joints, step=0.05, max_points=400):
         """The path being followed, sampled every `step` s of trajectory time (the waypoints
-        alone would miss the curves between them), stamped with when the base's rotation in it
-        is measured from."""
+        alone would miss the curves between them), stamped now, with the base's rotation from
+        its heading now (the plan's is from the goal's start)."""
         times = np.linspace(0.0, plan.duration, int(np.clip(np.ceil(plan.duration / step), 1, max_points - 1)) + 1)
-        msg = JointTrajectory(header=Header(stamp=self._base_reference_stamp), joint_names=joints)
-        msg.points = [JointTrajectoryPoint(positions=[float(v) for v in plan.sample(t)[0]], time_from_start=duration_msg(t))
-                      for t in times]
+        offset = np.zeros(len(joints))
+        if self.BASE_ROTATION_JOINT in joints:
+            offset[joints.index(self.BASE_ROTATION_JOINT)] = self._joint_position(self.BASE_ROTATION_JOINT)
+        msg = JointTrajectory(header=Header(stamp=self.driver.get_clock().now().to_msg()), joint_names=joints)
+        msg.points = [JointTrajectoryPoint(positions=[float(v) for v in plan.sample(t)[0] - offset],
+                                           time_from_start=duration_msg(t)) for t in times]
         self._pub_plan.publish(msg)
 
     def _positions(self, joints):
