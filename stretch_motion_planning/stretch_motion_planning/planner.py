@@ -8,8 +8,8 @@ Paths from the template and RRT stages are shortened by skipping any waypoints t
 straight line can go around. No ROS imports.
 
 Obstacles beyond the robot itself come in through an optional `obstacles` hook, an object
-with motion_clear(a, b) (the straight line from a to b is clear of them), blocked_at(q) (q is
-already touching one) and path_time(path) (predicted execution time of a path, s; the obstacle grid's is
+with motion_clear(a, b) (the straight line from a to b is clear of them; from a start already
+touching one, it may withdraw slowly), blocked_at(q) (q is already touching one) and path_time(path) (predicted execution time of a path, s; the obstacle grid's is
 stretch_obstacle_grid/tools/grid_planning.py). plan() returns the first path found;
 plan_best() gathers several and returns the one path_time says is fastest.
 """
@@ -109,10 +109,13 @@ class StretchPlanner:
             return result(False, f"Goal moves joints that are locked: {moved}")
         if self.collision.in_collision(goal):
             return result(False, f"Goal is {self._describe_invalid(goal)}")
+        # A start touching an obstacle is fine: motion_clear lets the robot withdraw from it.
+        touching = ""
         if self.obstacles is not None:
-            for name, q in (("Start", start), ("Goal", goal)):
-                if self.obstacles.blocked_at(q):
-                    return result(False, f"{name} is touching an obstacle")
+            if self.obstacles.blocked_at(goal):
+                return result(False, "Goal is touching an obstacle")
+            if self.obstacles.blocked_at(start):
+                touching = " (the start is touching an obstacle)"
 
         # A start inside the padding but not touching anything gets a short move out first.
         prefix = []
@@ -137,7 +140,7 @@ class StretchPlanner:
 
         path = self._rrt_connect(start, goal, active, deadline=t0 + timeout)
         if path is None:
-            return result(False, f"No path found within {timeout:.2f} s")
+            return result(False, f"No path found within {timeout:.2f} s{touching}")
         return found("rrt", "RRT-Connect path", self.shortcut(path))
 
     def plan_best(self, start, goal, active=None, timeout=None, rrt_runs=3):

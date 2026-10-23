@@ -7,7 +7,8 @@ planner's configurations, cut into steps at the planner's check resolution, pose
 robot's planning body, through MotionCheck.
 
 - Blocked: a step sweeps an obstacle (occupied or static voxel). Only obstacles are hard
-  constraints.
+  constraints, except that motion starting against one may withdraw from it, slowly
+  (MotionCheck's escape steps; Elaine, 2026-10-23).
 - Time: each step takes at least its nominal time (the slowest joint's change at that joint's
   top speed) and at least MotionCheck's minimum for it: contact speed through unsafe space
   (unknown, contaminated shadow), slower near obstacles. So a path through unknown space is
@@ -86,10 +87,12 @@ class GridObstacles:
 
     def motion_clear(self, a, b):
         """True if the straight line from a to b sweeps no obstacle (MotionCheck.first_blocked:
-        check()'s blocked test alone, stopping at the first blocked step). Most of the time goes
-        to posing the robot at every sample, so it's checked at `coarse` times the resolution
-        first (about 4 cm steps): MotionCheck bounds each step's whole sweep, larger for larger
-        steps, so clear there is clear; only a coarse block is checked again at the resolution."""
+        check()'s blocked test alone, stopping at the first blocked step; withdrawing from one a
+        touches is allowed). Most of the time goes to posing the robot at every sample, so it's
+        checked at `coarse` times the resolution first (about 4 cm steps): MotionCheck bounds
+        each step's whole sweep, larger for larger steps, so clear there is clear; only a coarse
+        block is checked again at the resolution. (Coarse steps are too long to count as
+        withdrawing, so that's left to the fine check.)"""
         margin = self.margin if self.margin > 0.0 and not self.blocked_at(a, self.margin) else 0.0
         return self._clear(a, b, self.coarse, margin) or (self.coarse > 1.0 and self._clear(a, b, 1.0, margin))
 

@@ -458,7 +458,7 @@ class TrajectoryPlannerNode(Node):
         timeout = request.timeout or self.get_parameter("replan_timeout").value
         max_detours = request.max_detours or self.get_parameter("max_detours").value
         deadline = time.perf_counter() + timeout
-        found = []
+        found, failures = [], []
         targets = sorted(set(float(t) for t in request.rejoin_times))
         for k, rejoin in enumerate(targets):
             remaining = deadline - time.perf_counter()
@@ -475,9 +475,11 @@ class TrajectoryPlannerNode(Node):
                 rest = [reference_segment(j) for j in range(i, len(reference) - 1)]
             result = self.planner.plan(start, goal, active, timeout=remaining / (len(targets) - k))
             if not result.success:
+                failures.append(f"{rejoin:.2f} s: {result.message}")
                 continue
             predicted = self._score(obstacles, list(zip(result.path[:-1], result.path[1:])) + rest)
             if not math.isfinite(predicted):
+                failures.append(f"{rejoin:.2f} s: the rest of the goal's trajectory is blocked")
                 continue
             found.append((predicted, rejoin, result))
         found.sort(key=lambda x: x[0])
@@ -492,7 +494,8 @@ class TrajectoryPlannerNode(Node):
             response.detour_methods.append(result.method)
         response.message = (f"{len(found)} detours of {len(targets)} rejoin points; current "
                             f"{response.current_time:.1f} s, best {found[0][0]:.1f} s" if found else
-                            f"no detour to any of {len(targets)} rejoin points; current {response.current_time:.1f} s")
+                            f"no detour to any of {len(targets)} rejoin points ({'; '.join(failures)}); "
+                            f"current {response.current_time:.1f} s")
 
 
 def main(args=None):

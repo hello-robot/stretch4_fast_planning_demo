@@ -41,6 +41,12 @@ struct MotionLimits
   // m/s anywhere the robot sweeps unknown space or contaminated shadow, which might hide a
   // person.
   float unsafe_speed = 0.05f;
+  // m/s for a step that only withdraws from obstacles the robot is already touching (see
+  // MotionCheck::check): slow, since what it touches may be a person.
+  float escape_speed = 0.02f;
+  // m: a step can only be an escape if no piece moves more than this in it (the test compares
+  // the step's ends, which says little about a long step).
+  float max_escape_step = 0.03f;
   float standoff = 0.0f;           // m (the "n" of the design)
   float obstacle_speed = 1.5f;     // m/s a moving (not static) obstacle is assumed to approach at
   // m/s something unseen is assumed to come out of unsafe space at. 0: the robot only has to be
@@ -70,6 +76,9 @@ struct StepLimit
   // resolution of one.
   bool blocked = false;
   bool unsafe = false;
+  // The step would be blocked, but it only withdraws from obstacles the robot already touches,
+  // so it's allowed at escape_speed.
+  bool escape = false;
   int shape = -1;             // index of the limiting piece's shape
 };
 
@@ -121,6 +130,14 @@ public:
   // minus its end); obstacles may have come obstacle_speed * age closer since. `theta_slack`
   // (rad) widens every box in theta, for base rotation since that frame.
   //
+  // A step that would be blocked but only withdraws from what the robot already touches is an
+  // escape step instead, allowed at escape_speed (Elaine, 2026-10-23: the robot must be able to
+  // back away from a hand or a phantom it's stopped against). Withdrawing: at the step's start
+  // the moving pieces touch some obstacle voxels (within the blocked distance of where the
+  // sweep reaches), at its end they touch only some of those, none of those gets nearer a
+  // moving piece it's outside of, and no moving piece's center gets nearer the ones inside it.
+  // No piece may move more than max_escape_step.
+  //
   // `braking` (one per step, optional): max over the joints of |joint change over the step| /
   // that joint's deceleration (s^2). Slowing down along the path, every joint slows in
   // proportion, so the slowest-braking joint sets the stopping time, and a piece that moves
@@ -133,7 +150,8 @@ public:
   // The first step check(grid, samples, ..., theta_slack) would call blocked, or -1: the same
   // test, without the clearances and speeds, stopping at the first blocked step. For a planner
   // that only needs to know whether a motion is clear. With margin (m) above check()'s
-  // threshold, a step also counts as blocked within margin of an obstacle.
+  // threshold, a step also counts as blocked within margin of an obstacle. An escape step
+  // (see check()) isn't blocked.
   int first_blocked(const ObstacleGrid & grid, const std::vector<SelfModel> & samples, float theta_slack = 0.0f,
     float margin = 0.0f) const;
 

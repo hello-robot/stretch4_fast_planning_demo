@@ -204,6 +204,146 @@ float search_clearance(
   return done(lo);
 }
 
+// The distance check() calls a step blocked at: the smallest its clearance search tries.
+// clear(d) only gets harder as d grows, so every distance it tries fails exactly when that one
+// does.
+float blocked_distance(const MotionLimits & limits)
+{
+  float smallest = limits.max_clearance;
+  while (smallest > limits.clearance_resolution) {
+    smallest *= 0.5f;
+  }
+  return smallest;
+}
+
+// The obstacle voxels within d of any of `volumes`, as step_hits lists them: for each volume
+// that holds some, the ones in both of its bounds, or its cylindrical bound's if none is.
+// Sorted, one entry each.
+std::vector<size_t> touched_voxels(const ObstacleGrid & grid, const std::vector<SweptPiece> & volumes, float d)
+{
+  const uint32_t mask = (1u << kOccupied) | (1u << kStatic);
+  const std::vector<uint8_t> & labels = grid.labels();
+  std::vector<size_t> touched, voxels;
+  for (const SweptPiece & volume : volumes) {
+    if (volume.clear(grid.occupied_table(), grid.occupied_box_table(), d)) {
+      continue;
+    }
+    const Eigen::AlignedBox3f box = volume.box_at(d);
+    voxels.clear();
+    grid.occupied_table().voxels(volume.cylinder_at(d), &voxels);
+    const size_t first = touched.size();
+    for (size_t voxel : voxels) {
+      if ((mask >> labels[voxel] & 1u) && grid.occupied_box_table().counts(box, voxel)) {
+        touched.push_back(voxel);
+      }
+    }
+    if (touched.size() == first) {
+      for (size_t voxel : voxels) {
+        if (mask >> labels[voxel] & 1u) {
+          touched.push_back(voxel);
+        }
+      }
+    }
+  }
+  std::sort(touched.begin(), touched.end());
+  touched.erase(std::unique(touched.begin(), touched.end()), touched.end());
+  return touched;
+}
+
+// Distance (m) from a point to a piece (a box), 0 inside it.
+float box_distance(const Piece & piece, const Eigen::Vector3f & point)
+{
+  // piece_corners orders the corners by bits: x, y, z.
+  const Eigen::Vector3f & origin = piece.corners[0];
+  float outside = 0.0f;
+  for (int i = 0; i < 3; ++i) {
+    const Eigen::Vector3f edge = piece.corners[1 << i] - origin;
+    const float length = edge.norm();
+    const float from_center = (length > 0.0f ? (point - origin).dot(edge) / length : 0.0f) - 0.5f * length;
+    const float beyond = std::max(0.0f, std::abs(from_center) - 0.5f * length);
+    outside += beyond * beyond;
+  }
+  return std::sqrt(outside);
+}
+
+Eigen::Vector3f piece_center(const Piece & piece)
+{
+  Eigen::Vector3f sum = Eigen::Vector3f::Zero();
+  for (const auto & corner : piece.corners) {
+    sum += corner;
+  }
+  return sum / static_cast<float>(piece.corners.size());
+}
+
+// Whether the step from one sample's pieces `a` to the next's `b` only withdraws from
+// obstacles: the moving pieces touch some obstacle voxels at a; at b they touch only some of
+// those; none of those outside a moving piece at a gets nearer it (sliding past at the same
+// distance is fine); and no moving piece's center gets nearer the middle (centroid) of the
+// ones inside it at a. A piece leaving an obstacle moves away from what's inside it; one
+// pushing into or through it (a wall's face, say) moves toward it.
+// Touching is within d of a piece grown by half its travel, as far as the step's sweep
+// reaches, so a step that starts just clear but whose sweep reaches back to an obstacle counts
+// too. Only the ends are compared, so a step can graze something new by up to half its
+// travel, at most max_step / 2: a step with a piece moving further never withdraws.
+bool withdraws(
+  const ObstacleGrid & grid, const std::vector<Piece> & a, const std::vector<Piece> & b, float theta_slack,
+  float d, float min_motion, float max_step)
+{
+  constexpr float kTolerance = 0.001f;  // m
+  std::vector<size_t> moving;
+  std::vector<float> reach;  // m from a voxel's center that a piece may touch it from
+  std::vector<SweptPiece> before, after;
+  for (size_t p = 0; p < a.size(); ++p) {
+    const float travel = piece_travel(a[p], b[p]);
+    if (travel > max_step) {
+      return false;
+    }
+    if (travel >= min_motion) {
+      moving.push_back(p);
+      reach.push_back(d + 0.5f * travel + grid.grid().config().cell);
+      before.push_back(sweep(a[p], a[p], travel, theta_slack));  // grown by half the travel
+      after.push_back(sweep(b[p], b[p], travel, theta_slack));
+    }
+  }
+  const std::vector<size_t> touching = touched_voxels(grid, before, d);
+  if (touching.empty()) {
+    return false;
+  }
+  const std::vector<size_t> still = touched_voxels(grid, after, d);
+  if (!std::includes(touching.begin(), touching.end(), still.begin(), still.end())) {
+    return false;
+  }
+  std::vector<Eigen::Vector3f> centers(touching.size());
+  for (size_t v = 0; v < touching.size(); ++v) {
+    grid.grid().center(touching[v], &centers[v].x(), &centers[v].y(), &centers[v].z());
+  }
+  for (size_t i = 0; i < moving.size(); ++i) {
+    const Piece & from = a[moving[i]];
+    const Piece & to = b[moving[i]];
+    Eigen::Vector3f inside_sum = Eigen::Vector3f::Zero();
+    int inside = 0;
+    for (const Eigen::Vector3f & center : centers) {
+      const float before_distance = box_distance(from, center);
+      if (before_distance == 0.0f) {
+        inside_sum += center;
+        ++inside;
+        continue;
+      }
+      const float after_distance = box_distance(to, center);
+      if (after_distance <= reach[i] && after_distance < before_distance - kTolerance) {
+        return false;
+      }
+    }
+    if (inside > 0) {
+      const Eigen::Vector3f middle = inside_sum / static_cast<float>(inside);
+      if ((piece_center(to) - middle).norm() < (piece_center(from) - middle).norm() - kTolerance) {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
 }  // namespace
 
 CylinderBox cylinder_bounds(const std::vector<Eigen::Vector3f> & points)
@@ -356,11 +496,14 @@ std::vector<StepLimit> MotionCheck::check(
   const float approach = limits_.obstacle_speed * std::max(0.0f, age);
   const float unsafe_approach = limits_.unsafe_obstacle_speed * std::max(0.0f, age);
   const float occupied_final = limits_.standoff > 0.0f ? 0.0f : limits_.contact_speed;
+  const float blocked_at_distance = blocked_distance(limits_);
 
   steps.resize(samples.size() - 1);
   for (size_t k = 0; k + 1 < samples.size(); ++k) {
     StepLimit & step = steps[k];
     step.clearance_occupied = step.clearance_moving = step.clearance_unsafe = limits_.max_clearance;
+    float furthest = 0.0f;  // the most any piece moves, and its shape
+    int furthest_shape = -1;
     size_t piece_index = 0;
     for (size_t s = 0; s < shape_count; ++s) {
       for (int p = 0; p < piece_count[s]; ++p, ++piece_index) {
@@ -369,6 +512,10 @@ std::vector<StepLimit> MotionCheck::check(
         const float travel = piece_travel(a, b);
         if (travel < limits_.min_motion) {
           continue;
+        }
+        if (travel > furthest) {
+          furthest = travel;
+          furthest_shape = static_cast<int>(s);
         }
         const SweptPiece swept = sweep(a, b, travel, theta_slack);
         const float to_occupied = search_clearance([&](float d) {
@@ -401,6 +548,17 @@ std::vector<StepLimit> MotionCheck::check(
         }
       }
     }
+    if (step.blocked && limits_.escape_speed > 0.0f &&
+      withdraws(grid, pieces[k], pieces[k + 1], theta_slack, blocked_at_distance, limits_.min_motion,
+        limits_.max_escape_step))
+    {
+      step.blocked = false;
+      step.escape = true;
+      step.min_duration = furthest / limits_.escape_speed;
+      step.speed = limits_.escape_speed;
+      step.travel = furthest;
+      step.shape = furthest_shape;
+    }
   }
   return steps;
 }
@@ -411,14 +569,8 @@ int MotionCheck::first_blocked(
   if (samples.size() < 2) {
     return -1;
   }
-  // check() calls a step blocked when search_clearance returns 0, i.e. when every distance its
-  // bisection tries fails; clear(d) only gets harder as d grows, so that's when the smallest
-  // distance it would try fails.
-  float smallest = limits_.max_clearance;
-  while (smallest > limits_.clearance_resolution) {
-    smallest *= 0.5f;
-  }
-  smallest = std::max(smallest, margin);
+  const float threshold = blocked_distance(limits_);
+  const float smallest = std::max(threshold, margin);
   const std::vector<Eigen::Vector3i> cuts = piece_cuts(samples, limits_.max_piece);
   std::vector<Piece> a = sample_pieces(samples[0], cuts);
   for (size_t k = 0; k + 1 < samples.size(); ++k) {
@@ -430,6 +582,11 @@ int MotionCheck::first_blocked(
       }
       const SweptPiece swept = sweep(a[p], b[p], travel, theta_slack);
       if (!swept.clear(grid.occupied_table(), grid.occupied_box_table(), smallest)) {
+        if (limits_.escape_speed > 0.0f &&
+          withdraws(grid, a, b, theta_slack, threshold, limits_.min_motion, limits_.max_escape_step))
+        {
+          break;  // an escape step, as check() would call it
+        }
         return static_cast<int>(k);
       }
     }
@@ -441,11 +598,7 @@ int MotionCheck::first_blocked(
 bool MotionCheck::blocked_at(
   const ObstacleGrid & grid, const SelfModel & body, float theta_slack, float margin) const
 {
-  float smallest = limits_.max_clearance;
-  while (smallest > limits_.clearance_resolution) {
-    smallest *= 0.5f;
-  }
-  smallest = std::max(smallest, margin);
+  const float smallest = std::max(blocked_distance(limits_), margin);
   const std::vector<Eigen::Vector3i> cuts = piece_cuts({body}, limits_.max_piece);
   for (const Piece & piece : sample_pieces(body, cuts)) {
     const SweptPiece still = sweep(piece, piece, 0.0f, theta_slack);

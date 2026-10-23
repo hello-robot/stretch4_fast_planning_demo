@@ -1113,3 +1113,58 @@ TEST(MotionCheck, AMarginBlocksMotionThatComesClose)
   EXPECT_TRUE(checker.blocked_at(*labeled, samples.back(), 0.0f, 0.15f));
 }
 
+TEST(MotionCheck, BackingOutOfAnObstacleIsAnEscape)
+{
+  Scene scene;
+  scene.obstacles.emplace_back(Eigen::Vector3f(1.0f, -0.1f, 0.0f), Eigen::Vector3f(1.1f, 0.1f, 1.0f));
+  const auto labeled = label_scene(scene);
+  // From into the post (front face at 1.05) back to 10 cm short of it, 1 cm at a time.
+  std::vector<SelfModel> samples;
+  for (int i = 0; i <= 15; ++i) {samples.push_back(arm_at(scene, 0.55f - 0.01f * i));}
+  MotionLimits limits;
+  const MotionCheck checker(limits);
+  const std::vector<StepLimit> steps = checker.check(*labeled, samples);
+  ASSERT_TRUE(steps.front().escape);
+  int escapes = 0;
+  for (const StepLimit & step : steps) {
+    EXPECT_FALSE(step.blocked);
+    if (step.escape) {
+      ++escapes;
+      EXPECT_FLOAT_EQ(step.speed, limits.escape_speed);
+      EXPECT_NEAR(step.min_duration, 0.01f / limits.escape_speed, 1e-3f);
+    }
+  }
+  EXPECT_FALSE(steps.back().escape);  // clear of it by then
+  EXPECT_LT(escapes, 10);
+  EXPECT_EQ(checker.first_blocked(*labeled, samples), -1);
+
+  // Without an escape speed, backing out is blocked like anything else.
+  limits.escape_speed = 0.0f;
+  EXPECT_TRUE(MotionCheck(limits).check(*labeled, samples).front().blocked);
+  EXPECT_EQ(MotionCheck(limits).first_blocked(*labeled, samples), 0);
+}
+
+TEST(MotionCheck, PushingFurtherInOrSlidingAlongIsNoEscape)
+{
+  Scene scene;
+  scene.obstacles.emplace_back(Eigen::Vector3f(1.0f, -0.1f, 0.0f), Eigen::Vector3f(1.1f, 0.1f, 1.0f));
+  const auto labeled = label_scene(scene);
+  const MotionCheck checker;
+  // Further in: the post's face (all of it the arm touches already) goes deeper into the arm.
+  std::vector<SelfModel> deeper;
+  for (int i = 0; i <= 3; ++i) {deeper.push_back(arm_at(scene, 0.55f + 0.01f * i));}
+  const std::vector<StepLimit> in = checker.check(*labeled, deeper);
+  EXPECT_TRUE(in.front().blocked);
+  EXPECT_FALSE(in.front().escape);
+  EXPECT_EQ(checker.first_blocked(*labeled, deeper), 0);
+  // Sideways along the face, onto more of it.
+  std::vector<SelfModel> sideways;
+  for (int i = 0; i <= 5; ++i) {
+    SelfModel body = arm_at(scene, 0.55f);
+    Eigen::Isometry3f pose = body.shapes()[0].pose;
+    pose.pretranslate(Eigen::Vector3f(0.0f, 0.01f * i, 0.0f));
+    sideways.push_back(SelfModel({SelfShape{SelfShape::Type::kBox, pose, body.shapes()[0].dims}}));
+  }
+  EXPECT_NE(checker.first_blocked(*labeled, sideways), -1);
+}
+

@@ -147,6 +147,8 @@ class ObstacleMonitor(Node):
         limits = og.MotionLimits()
         limits.latency = self.declare_parameter("latency", 0.15).value
         limits.obstacle_speed = self.declare_parameter("obstacle_speed", 1.5).value
+        # m/s for motion that only withdraws from obstacles the robot touches (0: never allowed)
+        limits.escape_speed = self.declare_parameter("escape_speed", 0.02).value
         self.checker = og.MotionCheck(limits)
 
         # Posing the shapes changes the model in place (the arm box stretches), so the cloud
