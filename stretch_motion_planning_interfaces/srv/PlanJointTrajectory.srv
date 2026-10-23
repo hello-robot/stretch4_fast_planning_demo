@@ -12,6 +12,10 @@ sensor_msgs/JointState start
 # mobile_base_rotation_joint is given here.
 sensor_msgs/JointState goal
 
+# Only the joints named in goal may move, all the way (by default the others may move on the
+# way and return to their start positions). For a caller that can only command those joints.
+bool move_only_goal_joints
+
 # Obstacles to avoid, one pose per primitive, in obstacle_frame. An empty obstacle_frame
 # means base_footprint at the start state. A floor at z = 0 is always included.
 string obstacle_frame

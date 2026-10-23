@@ -332,6 +332,8 @@ class TrajectoryPlannerNode(Node):
         # The base only rotates if the goal asks for a base rotation.
         active = np.ones(len(JOINT_NAMES), bool)
         active[THETA] = "mobile_base_rotation_joint" in request.goal.name
+        if request.move_only_goal_joints:
+            active = np.array([name in request.goal.name for name in JOINT_NAMES])
 
         obstacles = self.request_obstacles(request)
         if request.use_planning_scene:

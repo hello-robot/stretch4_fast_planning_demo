@@ -76,12 +76,14 @@ class CheckResult:
 
     starts: each segment's start (tau); ends: its end. caps: the most scale the segment allows.
     unsafe: the segment sweeps unsafe space. stamp: when the check was asked (s, monotonic).
+    plan_id: which plan it checked (replanning switches plans).
     """
     starts: np.ndarray
     ends: np.ndarray
     caps: np.ndarray
     unsafe: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=bool))
     stamp: float = 0.0
+    plan_id: int = 0
 
     @property
     def checked_until(self):
