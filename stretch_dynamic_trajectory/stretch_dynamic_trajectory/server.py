@@ -28,8 +28,14 @@ driver's guarded-contact sensitivity is raised (unsafe_sensitivity), and set bac
 (safe_sensitivity) once it's clear. A wrist joint running well over its commanded speed (the
 Feetech servos sometimes keep a stale speed) is quick-stopped and the goal aborted.
 
-Not yet: the software contact stop with back-off, replanning around a blocked path, and
-dodging while holding a position.
+A rise in a moving joint's effort over its free-motion level (contact.py) means contact: the
+robot stops, the joint that touched backs off back_off_distance along its own axis at
+back_off_speed (both m at the contact point), and holds; never limp. Then contact_action:
+"abort" ends the goal, reporting the contact; "resume" goes back along the plan to where the
+robot backed off to, holds contact_hold s, and carries on (into the same thing again, if it's
+still there), ending the goal after contact_resume_limit contacts in it.
+
+Not yet: replanning around a blocked path, and dodging while holding a position.
 """
 
 import threading
@@ -49,8 +55,9 @@ from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 from hello_helpers.stretch4_ros_api import StretchTrajectoryActionServer
 from stretch_motion_planning_interfaces.srv import CheckMotion
 
+from stretch_dynamic_trajectory.contact import CONTACT_SETTINGS, ContactDetector
 from stretch_dynamic_trajectory.timing import (CheckResult, ResumeGate, Trajectory, blocked_anywhere, check_times,
-                                               creeping_limits, scale_deceleration, segment_caps, step_scale,
+                                               creeping_limits, rewind, scale_deceleration, segment_caps, step_scale,
                                                stopping_for_block, target_scale)
 
 WRIST_JOINTS = ("wrist_yaw_joint", "wrist_pitch_joint", "wrist_roll_joint")
@@ -114,6 +121,18 @@ class DynamicTrajectoryActionServer(StretchTrajectoryActionServer):
         # Creeping stops this far (m, at the fastest point) short of a block: more than the grid's
         # self-filter padding (3 cm), within which the robot can't see an obstacle, plus a voxel.
         add_param("creep_standoff", 0.05)
+        # Contact (see contact.py): on a rise in a moving joint's effort, stop, back that joint
+        # off back_off_distance (m at the contact point: the gripper for a wrist joint) at
+        # back_off_speed (m/s), hold, then contact_action: "abort" or "resume" (after
+        # contact_hold s).
+        add_param("contact_detection", True)
+        # Multiplies contact.py's effort thresholds: below 1 stops on a lighter touch.
+        add_param("contact_threshold_scale", 1.0)
+        add_param("contact_action", "abort")
+        add_param("back_off_distance", 0.05)
+        add_param("back_off_speed", 0.02)
+        add_param("contact_hold", 2.0)
+        add_param("contact_resume_limit", 3)
         # While held, the first creep_check_fine_horizon s of each check go in steps of
         # creep_check_step, so a block near the robot is placed closely enough to brake for gently.
         add_param("creep_check_step", 0.02)
@@ -272,6 +291,14 @@ class DynamicTrajectoryActionServer(StretchTrajectoryActionServer):
         levers = np.array([CREEP_LEVERS.get(j, 1.0) for j in joints])
         check_timeout = self.get_param("check_timeout")
         max_lag = self.get_param("max_lag_tolerances")
+        threshold_scale = self.get_param("contact_threshold_scale")
+        detectors = ({i: ContactDetector(CONTACT_SETTINGS[j], threshold_scale=threshold_scale)
+                      for i, j in enumerate(joints) if j in CONTACT_SETTINGS}
+                     if self.get_param("contact_detection") else {})
+        commands = np.zeros(len(joints))  # last loop's, which the efforts now respond to
+        hold_until = None  # after a contact, with contact_action "resume"
+        contact = 0.0  # the last contact's effort rise, for the timing topic
+        contacts = 0
         catch_up_fraction, catch_up_floor = self.get_param("catch_up_fraction"), self.get_param("catch_up_floor")
 
         tau, scale = 0.0, 0.0
@@ -297,7 +324,7 @@ class DynamicTrajectoryActionServer(StretchTrajectoryActionServer):
                 gate.update(check.stamp, stopping_for_block(check, target), blocked_anywhere(check))
                 self._held = gate.held
             up_rate = max_up_rate
-            if gate.state == ResumeGate.STOPPED:
+            if gate.state == ResumeGate.STOPPED or (hold_until is not None and now < hold_until):
                 target = 0.0
             elif gate.state == ResumeGate.CREEPING:
                 creep_target, creep_rate = creeping_limits(plan, tau, horizon_end, check, creep_speed,
@@ -305,9 +332,25 @@ class DynamicTrajectoryActionServer(StretchTrajectoryActionServer):
                 target, up_rate = min(target, creep_target), min(up_rate, creep_rate)
             scale = step_scale(scale, target, rate_limit, dt, up_rate=up_rate)
 
+            actual = self._positions(joints)
+            touched = self._detect_contact(detectors, joints, commands, now)
+            if touched is not None:
+                i, rise = touched
+                contact, contacts = rise, contacts + 1
+                backed_off = self._back_off(joints, i, commands[i], levers[i], goal_handle, rate)
+                if self.get_param("contact_action") != "resume" or contacts >= self.get_param("contact_resume_limit"):
+                    return self._abort(goal_handle, FollowJointTrajectory.Result.PATH_TOLERANCE_VIOLATED,
+                                       f"contact on {joints[i]} (effort {rise:.0f} over free motion); "
+                                       f"backed off {backed_off:.3f}")
+                actual = self._positions(joints)
+                tau = rewind(plan, tau, i, actual[i])
+                scale, hold_until = 0.0, time.monotonic() + self.get_param("contact_hold")
+                commands = np.zeros(len(joints))
+                last = time.monotonic()
+                continue
+
             # Advance along the plan more slowly the further the robot lags behind it, and not
             # at all past max_lag tolerances.
-            actual = self._positions(joints)
             desired, _, _ = plan.sample(tau)
             lag = np.max(np.abs(desired - actual) / tolerances) / max_lag
             moving = scale * float(np.clip(1.0 - lag, 0.0, 1.0))
@@ -335,7 +378,7 @@ class DynamicTrajectoryActionServer(StretchTrajectoryActionServer):
                         self.driver.check_and_set_vel(joint, float(commands[i]), a=float(max_acceleration[i])
                                                       if np.isfinite(max_acceleration[i]) else None)
             self._publish(goal_handle, joints, tau, scale, target, check, now, desired, actual, commands, start,
-                          gate.state)
+                          gate.state, contact)
             rate.sleep()
 
         # At the end of the path: settle on the last waypoint as the default server does.
@@ -350,6 +393,59 @@ class DynamicTrajectoryActionServer(StretchTrajectoryActionServer):
         result = FollowJointTrajectory.Result()
         result.error_code = FollowJointTrajectory.Result.SUCCESSFUL
         return result
+
+    def _detect_contact(self, detectors, joints, commands, now):
+        """(joint index, effort rise) of the first joint in contact, or None."""
+        for i, detector in detectors.items():
+            effort = self._joint_effort(joints[i])
+            if effort is None:
+                continue
+            rise = detector.update(now, effort, commands[i])
+            if rise is not None:
+                return i, rise
+        return None
+
+    def _joint_effort(self, joint):
+        """A command joint's effort from the latest joint state (the arm's segments each carry
+        the arm's), or None."""
+        state = self.driver.last_known_state
+        if state is None:
+            return None
+        for name in getattr(self.driver, "SPLIT_JOINTS", {}).get(joint, [joint]):
+            if name in state.name:
+                k = state.name.index(name)
+                return float(state.effort[k]) if k < len(state.effort) else None
+        return None
+
+    def _back_off(self, joints, i, command, lever, goal_handle, rate):
+        """After contact: stop every joint, then move joint i back the way it came by
+        back_off_distance at back_off_speed (m at the contact point; lever m per unit of the
+        joint), and hold. Returns how far it went (joint units)."""
+        direction = -np.sign(command) if command else 0.0
+        speed = self.get_param("back_off_speed") / lever
+        distance = self.get_param("back_off_distance") / lever
+        self.driver.get_logger().warn(f"Contact on {joints[i]}: backing off {distance:.3f} at {speed:.3f}/s")
+        start = self._joint_position(joints[i])
+        deadline = time.monotonic() + 2.0 * distance / max(speed, 1e-6) + 1.0
+        moved = 0.0
+        while direction and moved < distance and time.monotonic() < deadline:
+            if self._check_for_interrupt(goal_handle) is not None:
+                break
+            with self._server_commands():
+                for k, joint in enumerate(joints):
+                    self._command_velocity(joint, direction * speed if k == i else 0.0)
+            rate.sleep()
+            moved = abs(self._joint_position(joints[i]) - start)
+        with self._server_commands():
+            for joint in joints:
+                self._command_velocity(joint, 0.0)
+        return moved
+
+    def _command_velocity(self, joint, velocity):
+        if joint == self.BASE_ROTATION_JOINT:
+            self._set_base_rotation_rate(velocity)
+        else:
+            self.driver.check_and_set_vel(joint, float(velocity))
 
     def _watch_wrists(self, joints, wrists, commands, overspeed_since, now):
         """Quick-stop a wrist that's been running well over its command (a stale servo speed);
@@ -367,7 +463,8 @@ class DynamicTrajectoryActionServer(StretchTrajectoryActionServer):
                 overspeed_since[i] = None
         return None
 
-    def _publish(self, goal_handle, joints, tau, scale, target, check, now, desired, actual, commands, start, gate):
+    def _publish(self, goal_handle, joints, tau, scale, target, check, now, desired, actual, commands, start, gate,
+                 contact=0.0):
         feedback = FollowJointTrajectory.Feedback(joint_names=joints)
         feedback.desired = JointTrajectoryPoint(positions=list(desired), time_from_start=duration_msg(tau))
         feedback.actual = JointTrajectoryPoint(positions=list(actual), time_from_start=duration_msg(
@@ -378,10 +475,11 @@ class DynamicTrajectoryActionServer(StretchTrajectoryActionServer):
         self.pub_actual_state.publish(JointState(name=joints, position=list(actual)))
         self.pub_commands.publish(JointState(name=joints, velocity=[float(c) for c in commands]))
         # tau and the scale, as a JointState so it plots with the rest; gate is the ResumeGate
-        # state (0 free, 1 stopped, 2 creeping)
+        # state (0 free, 1 stopped, 2 creeping); contact the last contact's effort rise (0: none)
         self._pub_timing.publish(JointState(
-            header=Header(stamp=stamp), name=["tau", "scale", "target_scale", "check_age", "gate"],
-            position=[tau, scale, target, (now - check.stamp) if check is not None else -1.0, float(gate)]))
+            header=Header(stamp=stamp), name=["tau", "scale", "target_scale", "check_age", "gate", "contact"],
+            position=[tau, scale, target, (now - check.stamp) if check is not None else -1.0, float(gate),
+                      float(contact)]))
 
     # --- checks ----------------------------------------------------------------------------------
 

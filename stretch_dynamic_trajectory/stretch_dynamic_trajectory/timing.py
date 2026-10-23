@@ -261,3 +261,18 @@ class ResumeGate:
         elif self.state == self.STOPPED and stamp - self._stopped_at >= self.delay:
             self.state = self.CREEPING
         return self.state
+
+
+def rewind(trajectory, tau, joint, position, step=0.01):
+    """The latest trajectory time at or before tau where `joint` is no further along the plan
+    than `position` (it backed off after a contact): where to carry on from."""
+    q_tau = trajectory.sample(tau)[0][joint]
+    t = tau
+    while t > 0.0:
+        q = trajectory.sample(t)[0][joint]
+        # Moving from q toward q_tau, the robot at `position` is at or past q.
+        if (q_tau - q) * (position - q) >= 0.0 and abs(position - q) <= abs(q_tau - q) + 1e-9:
+            return t
+        t = max(0.0, t - step)
+    return 0.0
+

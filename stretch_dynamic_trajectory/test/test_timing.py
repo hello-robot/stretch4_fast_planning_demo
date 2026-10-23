@@ -297,3 +297,15 @@ def test_creeping_stops_the_standoff_short_of_a_block():
     assert held.min() >= block - 0.05 - 0.01  # but crept up to it
     assert tau[-1] == pytest.approx(4.0)  # and finished once the block went away
 
+
+
+def test_rewinding_after_a_back_off_goes_to_where_the_robot_is_on_the_plan():
+    from stretch_dynamic_trajectory.timing import rewind
+    trajectory = line(duration=4.0, distance=0.2)
+    tau = 3.0
+    backed_off = trajectory.sample(tau)[0][0] - 0.05
+    t = rewind(trajectory, tau, 0, backed_off)
+    assert trajectory.sample(t)[0][0] == pytest.approx(backed_off, abs=0.001)
+    assert t < tau
+    assert rewind(trajectory, tau, 0, trajectory.sample(tau)[0][0]) == pytest.approx(tau)
+    assert rewind(trajectory, tau, 0, -1.0) == 0.0
