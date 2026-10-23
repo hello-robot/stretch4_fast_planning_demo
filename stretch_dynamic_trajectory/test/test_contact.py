@@ -68,17 +68,30 @@ def test_each_direction_has_its_own_free_level_and_threshold():
 ARM = YIELD_SETTINGS["arm_joint"]
 
 
-def test_a_held_joint_yields_only_to_a_push_beyond_its_holding_band():
-    yielder = Yielding(ARM, max_speed=0.05)
-    lo, hi = ARM.free_effort
-    # Anywhere in the band between its free-motion efforts is just holding.
-    assert not any(yielder.watch(t, e) for t, e in zip(np.arange(0, 2, 0.01), np.linspace(lo - 2, hi + 2, 200)))
-    # Pushed in: the motor pushes out harder to hold, above the band. It yields inward once the
-    # push has lasted trigger_time.
-    pushed = hi + ARM.threshold + 3.0
-    assert not yielder.watch(2.0, pushed)
-    assert not yielder.watch(2.05, pushed)
-    assert yielder.watch(2.11, pushed) and yielder.direction == -1
+def held(yielder, t0, t1, effort, dt=0.01):
+    """Watch a held joint over [t0, t1) at a constant (or callable) effort; True if it yields."""
+    for t in np.arange(t0, t1, dt):
+        if yielder.watch(t, effort(t) if callable(effort) else effort):
+            return t
+    return None
+
+
+def test_a_held_joint_yields_to_a_push_from_its_own_holding_level():
+    # As on the robot (2026-10-23): the held arm at about -2, a firm push in raising it to 10-12.
+    yielder = Yielding(ARM, max_speed=0.02)
+    # Settling after a move (effort decaying from its motion value) isn't a push.
+    assert held(yielder, 0.0, 1.5, lambda t: 11.0 - 13.0 * min(1.0, t / 1.2)) is None
+    # Slow drift isn't either.
+    assert held(yielder, 1.5, 4.0, lambda t: -2.0 + 0.5 * (t - 1.5)) is None
+    t = held(yielder, 4.0, 6.0, lambda t: -0.75 + 12.0 * min(1.0, (t - 4.0) / 0.4))
+    assert t is not None and t < 4.0 + 0.4 + 0.11 and yielder.direction == -1
+
+
+def test_the_hold_level_starts_over_after_moving():
+    yielder = Yielding(ARM, max_speed=0.02)
+    assert held(yielder, 0.0, 2.0, 0.0) is None
+    # It moved (no watch for a while), and now rests at a different level: no push.
+    assert held(yielder, 3.0, 5.0, 10.0) is None
 
 
 def test_yielding_follows_the_push_and_stops_when_it_eases():
@@ -97,23 +110,24 @@ def test_yielding_follows_the_push_and_stops_when_it_eases():
 
 def test_the_lift_yields_down_when_pushed_down_and_up_when_lifted():
     lift = YIELD_SETTINGS["lift_joint"]
-    yielder = Yielding(lift, max_speed=0.05)
-    lo, hi = lift.free_effort
-    assert yielder.pushed(hi + lift.threshold + 1.0) == -1  # holding up harder: pushed down
-    assert yielder.pushed(lo - lift.threshold - 1.0) == 1   # holding up less: lifted
-    assert yielder.pushed((lo + hi) / 2) == 0
+    yielder = Yielding(lift, max_speed=0.02)
+    yielder.hold_level = 30.0
+    assert yielder.pushed(30.0 + lift.threshold + 1.0) == -1  # holding up harder: pushed down
+    assert yielder.pushed(30.0 - lift.threshold - 1.0) == 1   # holding up less: lifted
+    assert yielder.pushed(30.0) == 0
 
 
 def test_after_a_yield_another_waits_for_the_push_to_let_go():
-    yielder = Yielding(ARM, max_speed=0.05)
-    pushed = ARM.free_effort[1] + ARM.threshold + 3.0
-    assert yielder.watch(0.0, pushed) is False and yielder.watch(0.2, pushed)
+    yielder = Yielding(ARM, max_speed=0.02)
+    pushed = ARM.threshold + 3.0
+    assert held(yielder, 0.0, 1.5, 0.0) is None
+    assert held(yielder, 1.5, 2.0, pushed) is not None
     yielder.stop()
-    # Still out of the band (never let go): no new yield.
-    assert not any(yielder.watch(t, pushed) for t in np.arange(1.0, 3.0, 0.05))
-    # Let go, then pushed again: yields again.
-    assert not yielder.watch(3.0, 0.0)
-    assert not yielder.watch(3.1, pushed) and yielder.watch(3.25, pushed)
+    # Held again (from the hold level before the push) and never let go: no new yield.
+    assert held(yielder, 3.0, 6.0, pushed) is None
+    # Let go (back to where it held before): not a push the other way. Then pushed again: yields.
+    assert held(yielder, 6.0, 8.0, 0.0) is None
+    assert held(yielder, 8.0, 9.0, pushed) is not None
 
 
 def test_a_yield_that_runs_into_something_stops_at_once():

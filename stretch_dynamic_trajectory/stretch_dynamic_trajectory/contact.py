@@ -114,11 +114,17 @@ class ContactDetector:
 # --- Yielding to a push ----------------------------------------------------------------------
 #
 # Elaine (2026-10-23): a joint that's pushed should move with the push, not hold firm until its
-# firmware guard trips and leaves it limp. Holding still, a stepper's effort sits anywhere
+# firmware guard trips and leaves it limp. Holding still, a stepper's effort settles somewhere
 # between its free-motion efforts in the two directions (static friction, and whichever way it
-# last moved), so a push is effort beyond that band by more than a threshold: pushing the arm
-# in makes the motor push out harder, above the band; pushing the lift down makes it hold up
-# harder, likewise. While yielding in direction d, the motor needs the free-motion effort for d
+# last moved), and a push moves it from there: pushing the arm in makes the motor push out
+# harder; pushing the lift down makes it hold up harder. So a push is effort beyond the joint's
+# own holding level by a threshold. The holding level follows the effort for settle s after the
+# joint comes to rest (it settles from its motion value: the arm's from about +11 to -2 in about
+# 1.5 s), then drifts at most hold_rate (0.3) points/s (resting effort drifts under 0.2/s),
+# which a push (about 10 points in a second or less) outruns. A band between the free-motion
+# efforts doesn't work: Elaine's firm pushes on the held arm (2026-10-23) raised its effort from
+# about -2 to only 10-12, inside the band.
+# While yielding in direction d, the motor needs the free-motion effort for d
 # (less, when someone pushes it along), so the push is how far the effort falls short of that;
 # the yield speed follows it. If the motor instead has to push harder than free motion, by the
 # threshold, the yield has run into something else, and it stops at once.
@@ -143,8 +149,16 @@ YIELD_SETTINGS = {
 class Yielding:
     """Watches one held stepper joint for a push, and yields to it."""
 
-    def __init__(self, settings, max_speed, threshold=None, trigger_time=0.1, release_time=0.5):
+    def __init__(self, settings, max_speed, threshold=None, trigger_time=0.1, release_time=0.5, settle=1.0,
+                 hold_rate=0.3):
         self.settings = settings
+        self.settle = settle
+        self.hold_rate = hold_rate
+        self.hold_level = None  # the holding effort
+        self._held_since = self._last_watch = None
+        # The holding level from before a yield's push: held again after it, the joint may still
+        # be pushed, and a level learned then would make letting go look like a push back.
+        self._before_push = None
         self.max_speed = max_speed  # joint units/s
         self.threshold = settings.threshold if threshold is None else threshold
         self.trigger_time = trigger_time  # s a push must last to start a yield
@@ -163,16 +177,34 @@ class Yielding:
 
     def pushed(self, effort):
         """The way a push on the held joint points (+1 or -1), or 0."""
-        lo, hi = self.settings.free_effort
-        if effort > hi + self.threshold:
+        if self.hold_level is None:
+            return 0
+        if effort > self.hold_level + self.threshold:
             return -1  # the motor pushes + to hold against it
-        if effort < lo - self.threshold:
+        if effort < self.hold_level - self.threshold:
             return 1
         return 0
 
+    def _follow_hold_level(self, t, effort):
+        if self._last_watch is None or t - self._last_watch > 0.2:  # it was moving, or yielding
+            if self._before_push is not None:
+                self._held_since, self.hold_level = t - self.settle, self._before_push
+                self._before_push = None
+            else:
+                self._held_since, self.hold_level = t, effort
+        elif t - self._held_since < self.settle:
+            self.hold_level = effort
+        else:
+            step = self.hold_rate * (t - self._last_watch)
+            self.hold_level += float(np.clip(effort - self.hold_level, -step, step))
+        self._last_watch = t
+
     def watch(self, t, effort):
-        """While held: True (and yielding from now) once a push has lasted trigger_time."""
-        direction = self.pushed(effort)
+        """Call every loop while the joint is held: True (and yielding from now) once a push has
+        lasted trigger_time."""
+        self._follow_hold_level(t, effort)
+        settling = t - self._held_since < self.settle
+        direction = 0 if settling else self.pushed(effort)
         if direction == 0:
             self._armed = True
         if not self._armed:
@@ -183,6 +215,7 @@ class Yielding:
         if t - self._pushed[1] < self.trigger_time:
             return False
         self.direction, self._released_since, self._pushed, self._armed = direction, None, (0, None), False
+        self._before_push = self.hold_level
         return True
 
     def stop(self):
