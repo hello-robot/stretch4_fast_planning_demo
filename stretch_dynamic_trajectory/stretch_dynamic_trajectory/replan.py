@@ -62,20 +62,28 @@ def rejoin_time(plan, block_end, margin, reference_duration):
     return float(min(reference_duration, reference + margin))
 
 
-def rejoin_candidates(plan, leave, reference_duration, margin, block=None, spacing=1.0, count=5):
+def rejoin_candidates(plan, leave, reference_duration, margin, block=None, spacing=1.0, count=5, match_path=False):
     """Reference times to try rejoining the reference at, leaving `plan` at plan time `leave`:
     from just past a block (block: (start, end, open_ended) plan times, as blocked_run gives),
     or, without one, from just past where the plan is (on a detour: just past where it left the
-    reference, so going straight back is one of them), every `spacing` s, and the goal."""
+    reference, so going straight back is one of them), every `spacing` s, and the goal.
+
+    A block that runs past what was checked: only the goal, or with `match_path` (the
+    reference's path matters, not just where it ends) from just past what was checked like any
+    other block, and then the goal only if it's within `count` candidates, so a detour never
+    skips more of the reference than it has to."""
     here = plan.reference_time(leave)
     if block is not None:
         _, end, open_ended = block
-        first = reference_duration if open_ended else rejoin_time(plan, end, margin, reference_duration)
+        first = (reference_duration if open_ended and not match_path else
+                 rejoin_time(plan, end, margin, reference_duration))
     elif here is None:
         first = min(reference_duration, plan.left + margin)
     else:
         first = min(reference_duration, here + margin)
     times = [first + k * spacing for k in range(count) if first + k * spacing < reference_duration]
+    if match_path and first + count * spacing < reference_duration:
+        return times
     return times + [reference_duration]
 
 
@@ -111,6 +119,54 @@ def splice(current, tau, leave, detour_times, detour_positions, reference, rejoi
         velocities[k] = current.sample(t)[1]
     return FollowedPlan(Trajectory(times, positions, velocities), detour_end=max(detour_end, 1e-9), rejoin=rejoin,
                         left=left)
+
+
+def plan_time_of(plan, reference_time):
+    """The plan time at which `plan` (a FollowedPlan) reaches reference time `reference_time`,
+    which must be at or past where it rejoins the reference."""
+    return reference_time - plan.rejoin + plan.detour_end
+
+
+def _stretch(trajectory, t0, t1, step=0.05):
+    """Positions along a Trajectory from t0 to t1: every `step` s and at its waypoints."""
+    t1 = max(t0, min(t1, trajectory.duration))
+    times = np.r_[np.arange(t0, t1, step), trajectory.times[(trajectory.times > t0) & (trajectory.times < t1)], t1]
+    return np.array([trajectory.sample(t)[0] for t in np.unique(times)])
+
+
+def _resample(points, weights, count):
+    """`count` points spread evenly along a polyline by weighted length."""
+    lengths = np.linalg.norm(np.diff(points, axis=0) * weights, axis=1)
+    along = np.r_[0.0, np.cumsum(lengths)]
+    if along[-1] <= 0.0:
+        return np.repeat(points[:1], count, axis=0)
+    at = np.linspace(0.0, along[-1], count)
+    return np.column_stack([np.interp(at, along, points[:, j]) for j in range(points.shape[1])])
+
+
+def path_deviation(plan, leave, reference, start, until, weights, samples=60):
+    """How far `plan` (a FollowedPlan) strays from the reference's path: from plan time `leave`
+    until it reaches reference time `until`, against the reference from reference time `start`
+    to `until`. Both stretches are spread over `samples` points evenly by length (weights:
+    roughly m of motion per unit of each joint), and it's the mean distance between matching
+    points (m).
+
+    Points are matched by how far along each path they are, not by time: the robot runs behind
+    the reference's schedule whenever it slows, and a path is the same path at any speed. Nor
+    by the nearest point on the reference, which would make a shortcut on a reference that
+    comes back on itself (a loop ending where it started) look like no deviation at all;
+    matching by progress makes skipping part of the reference cost what it skips. Every option
+    being compared should run to the same `until`: one that rejoins sooner then follows the
+    reference, and counts nothing for that stretch."""
+    weights = np.asarray(weights, dtype=float)
+    path = _stretch(plan.trajectory, leave, plan_time_of(plan, until))
+    original = _stretch(reference, start, until)
+    if len(path) < 2:
+        path = np.repeat(path, 2, axis=0)
+    if len(original) < 2:
+        original = np.repeat(original, 2, axis=0)
+    a, b = _resample(path, weights, samples), _resample(original, weights, samples)
+    return float(np.mean(np.linalg.norm((a - b) * weights, axis=1)))
 
 
 def left_at(plan, leave):

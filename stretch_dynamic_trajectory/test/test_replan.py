@@ -3,8 +3,8 @@
 import numpy as np
 import pytest
 
-from stretch_dynamic_trajectory.replan import (FollowedPlan, blocked_run, detour_start, left_at, rejoin_candidates,
-                                              rejoin_time, splice)
+from stretch_dynamic_trajectory.replan import (FollowedPlan, blocked_run, detour_start, left_at, path_deviation,
+                                              rejoin_candidates, rejoin_time, splice)
 from stretch_dynamic_trajectory.timing import CheckResult
 from stretch_dynamic_trajectory.timing import Trajectory
 
@@ -72,9 +72,78 @@ def test_rejoin_candidates_past_a_block_or_back_where_the_detour_left():
     assert rejoin_candidates(plan, 0.5, ref.duration, 0.5, block=(1.0, 1.5, False)) == pytest.approx([2.0, 3.0, 4.0])
     # Blocked past what was checked: only the goal.
     assert rejoin_candidates(plan, 0.5, ref.duration, 0.5, block=(1.0, 1.5, True)) == pytest.approx([4.0])
+    # Unless the path matters: from just past what was checked, as for any block.
+    assert rejoin_candidates(plan, 0.5, ref.duration, 0.5, block=(1.0, 1.5, True), match_path=True) == \
+        pytest.approx([2.0, 3.0, 4.0])
     # On a detour that left at 1.0 for 3.0: going back just past where it left is a candidate.
     detour = splice(ref, 1.0, 1.0, [0.0, 1.5], [ref.sample(1.0)[0], ref.sample(3.0)[0]], ref, 3.0, left=1.0)
     assert rejoin_candidates(detour, 0.5, ref.duration, 0.5)[0] == pytest.approx(1.5)
     assert left_at(detour, 0.5) == pytest.approx(1.0)
     assert left_at(plan, 0.7) == pytest.approx(0.7)
 
+
+
+def test_matching_the_path_leaves_out_a_goal_far_beyond_the_rejoin_points():
+    # A long reference (a loop, say, that ends where it started): rejoining at its goal would
+    # skip most of it, so match_path stops at the candidates just past the block.
+    long_ref = Trajectory([0.0, 30.0, 60.0], [[0.0, 0.0], [0.4, 0.0], [0.0, 0.0]])
+    plan = FollowedPlan(long_ref)
+    times = rejoin_candidates(plan, 5.0, long_ref.duration, 0.5, block=(6.0, 7.0, True), match_path=True)
+    assert times == pytest.approx([7.5, 8.5, 9.5, 10.5, 11.5])
+    assert rejoin_candidates(plan, 5.0, long_ref.duration, 0.5, block=(6.0, 7.0, True)) == pytest.approx([60.0])
+
+
+def circle(turns=1.0, period=8.0, radius=0.5, points=65):
+    """Two joints tracing a circle (as if both were meters), `turns` times around in
+    turns * period s, starting and ending at (radius, 0) when turns is whole."""
+    t = np.linspace(0.0, turns * period, points)
+    angle = 2.0 * np.pi * t / period
+    return Trajectory(t, np.column_stack([radius * np.cos(angle), radius * np.sin(angle)]))
+
+
+def detour(reference, leave, rejoin, middle=None, duration=1.0):
+    """A FollowedPlan from the reference at `leave` straight (or through `middle`) to the
+    reference at `rejoin`, then along the reference."""
+    a, b = reference.sample(leave)[0], reference.sample(rejoin)[0]
+    times, positions = [0.0, duration], [a, b]
+    if middle is not None:
+        times, positions = [0.0, 0.5 * duration, duration], [a, np.asarray(middle, dtype=float), b]
+    return splice(reference, leave, leave, times, positions, reference, rejoin, left=leave)
+
+
+WEIGHTS = np.ones(2)
+
+
+def test_following_the_path_at_any_speed_does_not_stray():
+    ref = circle()
+    assert path_deviation(FollowedPlan(ref), 0.0, ref, 0.0, 8.0, WEIGHTS) == pytest.approx(0.0, abs=1e-6)
+    # The same path at half speed, as a detour that reaches the reference's end (8 s) at 16 s.
+    slow = FollowedPlan(Trajectory(ref.times * 2.0, ref.positions), detour_end=16.0, rejoin=8.0)
+    assert path_deviation(slow, 0.0, ref, 0.0, 8.0, WEIGHTS) == pytest.approx(0.0, abs=2e-3)
+
+
+def test_a_chord_across_the_circle_strays_more_than_the_arc():
+    ref = circle()
+    chord = detour(ref, 0.0, 2.0)  # a quarter of the way round, straight across
+    arc = path_deviation(FollowedPlan(ref), 0.0, ref, 0.0, 2.0, WEIGHTS)
+    across = path_deviation(chord, 0.0, ref, 0.0, 2.0, WEIGHTS)
+    assert arc == pytest.approx(0.0, abs=1e-6)
+    assert across > 0.05  # the arc bulges about 0.15 m from the chord at its middle
+
+
+def test_skipping_a_loop_back_to_its_start_counts_as_skipping_it():
+    # Two loops ending where they began: from 1 s in, straight to the goal (right next to where
+    # the robot is) strays far more than going round, though it's far shorter.
+    ref = circle(turns=2.0)
+    shortcut = detour(ref, 1.0, 16.0)
+    assert path_deviation(shortcut, 0.0, ref, 1.0, 16.0, WEIGHTS) > 0.2
+    assert path_deviation(FollowedPlan(ref), 1.0, ref, 1.0, 16.0, WEIGHTS) == pytest.approx(0.0, abs=1e-6)
+
+
+def test_going_back_to_the_path_sooner_strays_less():
+    ref = circle()
+    # Both bulge 0.1 m outward from the reference at 1.5 s; one is back at 2 s, one at 4 s.
+    out = 1.2 * ref.sample(1.5)[0]
+    soon = detour(ref, 1.0, 2.0, middle=out)
+    late = detour(ref, 1.0, 4.0, middle=out, duration=3.0)
+    assert path_deviation(soon, 0.0, ref, 1.0, 4.0, WEIGHTS) < path_deviation(late, 0.0, ref, 1.0, 4.0, WEIGHTS)
