@@ -3,8 +3,8 @@
 import numpy as np
 import pytest
 
-from stretch_dynamic_trajectory.replan import (FollowedPlan, blocked_run, detour_start, left_at, path_deviation,
-                                              rejoin_candidates, rejoin_time, splice)
+from stretch_dynamic_trajectory.replan import (FollowedPlan, block_ahead, blocked_run, detour_start, left_at,
+                                              path_deviation, rejoin_candidates, rejoin_time, splice, worth_switching)
 from stretch_dynamic_trajectory.timing import CheckResult
 from stretch_dynamic_trajectory.timing import Trajectory
 
@@ -147,3 +147,22 @@ def test_going_back_to_the_path_sooner_strays_less():
     soon = detour(ref, 1.0, 2.0, middle=out)
     late = detour(ref, 1.0, 4.0, middle=out, duration=3.0)
     assert path_deviation(soon, 0.0, ref, 1.0, 4.0, WEIGHTS) < path_deviation(late, 0.0, ref, 1.0, 4.0, WEIGHTS)
+
+
+def check_of(caps, start=0.0, step=0.5):
+    caps = np.asarray(caps, dtype=float)
+    starts = start + step * np.arange(len(caps))
+    return CheckResult(starts=starts, ends=starts + step, caps=caps)
+
+
+def test_a_detour_is_taken_if_its_live_check_is_clear_or_blocked_further_on():
+    blocked_soon = check_of([1.0, 0.0, 0.0], start=2.0)  # the plan now: blocked 0.5 s ahead
+    assert block_ahead(blocked_soon, 2.0) == pytest.approx(0.5)
+    assert block_ahead(check_of([1.0, 1.0]), 0.0) == float("inf")
+    assert worth_switching(check_of([1.0, 1.0, 1.0]), 0.0, blocked_soon, 2.0)
+    # Blocked as soon as the plan now: no better. Blocked 1.5 s on: better by 1 s.
+    assert not worth_switching(check_of([1.0, 0.0, 1.0]), 0.0, blocked_soon, 2.0)
+    assert worth_switching(check_of([1.0, 1.0, 1.0, 0.0]), 0.0, blocked_soon, 2.0)
+    # Without a check of the plan now, it counts as blocked where the robot is.
+    assert worth_switching(check_of([1.0, 1.0, 0.0]), 0.0, None, 2.0)
+    assert not worth_switching(check_of([0.0, 1.0]), 0.0, None, 2.0)

@@ -90,7 +90,7 @@ from stretch_motion_planning_interfaces.srv import CheckMotion, ReplanAround
 from stretch_dynamic_trajectory.contact import (CONTACT_SETTINGS, YIELD_SETTINGS, ContactDetector, ContactSettings,
                                                 Yielding)
 from stretch_dynamic_trajectory.replan import (FollowedPlan, blocked_run, detour_start, left_at, path_deviation,
-                                              rejoin_candidates, splice)
+                                              rejoin_candidates, splice, worth_switching)
 from stretch_dynamic_trajectory.timing import (CheckResult, ResumeGate, Trajectory, blocked_anywhere, check_times,
                                                creeping_limits, rewind, scale_deceleration, segment_caps, step_scale,
                                                stopping_for_block, target_scale)
@@ -120,6 +120,7 @@ class DynamicTrajectoryActionServer(StretchTrajectoryActionServer):
         self._check_lock = threading.Lock()
         self._state = None  # (FollowedPlan, tau, positions) shared with the check thread
         self._check_now = threading.Event()  # wakes the check thread (a new plan to check)
+        self._proposal = None  # a detour for the check thread to check before switching (_Proposal)
         self._held = False  # whether the resume gate holds the robot, for the check thread
         self._sensitivity = None
         super().__init__(driver, action_name="follow_joint_trajectory_dynamic",
@@ -189,7 +190,7 @@ class DynamicTrajectoryActionServer(StretchTrajectoryActionServer):
         add_param("switch_margin", 0.5)
         add_param("replan_joints", "goal")
         add_param("replan_mode", "match_path")
-        add_param("match_margin", 0.01)
+        add_param("match_margin", 0.03)  # 0.01 switched every 1-2 s, often for 1-2 cm (circle_C5, sim)
         add_param("rejoin_margin", 0.5)
         add_param("replan_timeout", 1.0)
         add_param("blocked_timeout", 0.0)
@@ -277,6 +278,7 @@ class DynamicTrajectoryActionServer(StretchTrajectoryActionServer):
             self.direct_command_preempted = False
             self.preempted_joints = set()
             plan = FollowedPlan(self._plan(trajectory))
+            self._proposal = None
             self._publish_plan(plan.trajectory, joints)
             with self._check_lock:
                 self._check = None
@@ -413,15 +415,29 @@ class DynamicTrajectoryActionServer(StretchTrajectoryActionServer):
             if check is not None and (now - check.stamp > check_timeout or check.plan_id != followed.id):
                 check = None  # stale, or of a plan left behind: slow to a stop until a fresh one
 
-            # A detour from the planner, if one's ready: switch to it.
+            # A detour from the planner, if one's ready: have it checked on the live grid first
+            # (the planner's snapshot is older, and its margin small next to a moving hand).
             if replan is not None and replan.done.is_set():
                 detour = self._best_detour(replan, followed, reference, tau, joints)
-                replan = None
                 if detour is not None:
-                    followed, plan, tau = detour, detour.trajectory, 0.0
+                    self._proposal = _Proposal(detour, tau, replan.leave, followed.id)
+                    self._check_now.set()
+                replan = None
+            # Checked: switch to it if it's clear (or blocked further ahead than the plan now),
+            # with that check, so there's no gap without one (which would stop the robot).
+            proposal = self._proposal
+            if proposal is not None and proposal.done.is_set():
+                self._proposal = None
+                detour_tau = tau - proposal.spliced_at  # its lead-in is this plan, time for time
+                if (proposal.from_plan == followed.id and tau <= proposal.leave + 1e-6 and proposal.check is not None
+                        and worth_switching(proposal.check, detour_tau, check, tau)):
+                    followed, plan, tau = proposal.plan, proposal.plan.trajectory, detour_tau
                     self._state = (followed, tau, self._positions(joints))
                     gate = ResumeGate(self.get_param("resume_clear_checks"), self.get_param("resume_delay"))
-                    self._held, check, blocked_since = False, None, None
+                    self._held, blocked_since = False, None
+                    check = proposal.check
+                    with self._check_lock:
+                        self._check = check
                     self._publish_plan(plan, joints)
                     self._check_now.set()
             horizon_end = min(plan.duration, tau + self.get_param("check_horizon"))
@@ -790,8 +806,18 @@ class DynamicTrajectoryActionServer(StretchTrajectoryActionServer):
             started = time.monotonic()
             self._check_now.clear()
             try:
+                proposal = self._proposal
+                if proposal is not None and not proposal.done.is_set():
+                    # A detour to switch to: check it from where the robot is along its lead-in.
+                    _, tau, actual = self._state
+                    proposal.check = self._check_ahead(joints, (proposal.plan, tau - proposal.spliced_at, actual),
+                                                       publish=False)
+                    proposal.done.set()
+                    continue
                 result = self._check_ahead(joints)
-                if result is not None:
+                # Only for the plan being followed: if it switched to a checked detour meanwhile,
+                # this is of the plan it left, and would replace the detour's check.
+                if result is not None and result.plan_id == self._state[0].id:
                     with self._check_lock:
                         self._check = result
                     self._update_sensitivity(result)
@@ -799,10 +825,10 @@ class DynamicTrajectoryActionServer(StretchTrajectoryActionServer):
                 self.driver.get_logger().warn(f"check_motion failed: {e}", throttle_duration_sec=2.0)
             self._check_now.wait(max(0.0, period - (time.monotonic() - started)))
 
-    def _check_ahead(self, joints):
-        """One check of the next check_horizon s of the plan; a CheckResult, or None if there
-        was no good answer in time."""
-        followed, tau, actual = self._state
+    def _check_ahead(self, joints, state=None, publish=True):
+        """One check of the next check_horizon s of the plan (or of state: (FollowedPlan, tau,
+        positions)); a CheckResult, or None if there was no good answer in time."""
+        followed, tau, actual = state or self._state
         plan = followed.trajectory
         horizon, step = self.get_param("check_horizon"), self.get_param("check_step")
         end = min(plan.duration, tau + horizon)
@@ -835,7 +861,8 @@ class DynamicTrajectoryActionServer(StretchTrajectoryActionServer):
         starts = np.array([tau] + taus[:-1])
         ends = np.array(taus)
         caps = segment_caps(ends - starts, response.min_duration, response.blocked)
-        self._publish_check(response, tau, starts, caps, time.monotonic() - stamp)
+        if publish:
+            self._publish_check(response, tau, starts, caps, time.monotonic() - stamp)
         return CheckResult(starts=starts, ends=ends, caps=caps, unsafe=np.array(response.unsafe, dtype=bool),
                            stamp=stamp, plan_id=followed.id)
 
@@ -889,6 +916,18 @@ class DynamicTrajectoryActionServer(StretchTrajectoryActionServer):
         else:
             self.driver.get_logger().warn(f"Couldn't set sensitivity to {value}: {result.reason}",
                                           throttle_duration_sec=5.0)
+
+
+class _Proposal:
+    """A detour to switch to once the check thread has checked it on the live grid: the plan,
+    the tau of the plan it came from when it was made (its lead-in follows that plan from there,
+    time for time), where it leaves that plan, that plan's id, and once done, the check (None if
+    it failed)."""
+
+    def __init__(self, plan, spliced_at, leave, from_plan):
+        self.plan, self.spliced_at, self.leave, self.from_plan = plan, spliced_at, leave, from_plan
+        self.check = None
+        self.done = threading.Event()
 
 
 class _Replan:

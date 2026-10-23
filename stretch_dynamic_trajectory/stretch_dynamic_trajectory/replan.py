@@ -169,6 +169,26 @@ def path_deviation(plan, leave, reference, start, until, weights, samples=60):
     return float(np.mean(np.linalg.norm((a - b) * weights, axis=1)))
 
 
+def block_ahead(check, tau):
+    """Plan time from tau to the first blocked segment of a check (0 if it's blocked where the
+    robot is), or infinity if nothing's blocked."""
+    blocked = np.flatnonzero(np.asarray(check.caps) <= 0.0)
+    if not blocked.size:
+        return float("inf")
+    return max(0.0, float(check.starts[blocked[0]]) - tau)
+
+
+def worth_switching(detour_check, detour_tau, current_check, tau, gain=0.5):
+    """Whether to switch to a detour, from a check of it on the live grid: if it's clear, or its
+    first block is at least `gain` s further ahead than the plan being followed's (which counts
+    as blocked where the robot is without a check)."""
+    ahead = block_ahead(detour_check, detour_tau)
+    if ahead == float("inf"):
+        return True
+    current = block_ahead(current_check, tau) if current_check is not None else 0.0
+    return ahead > current + gain
+
+
 def left_at(plan, leave):
     """The reference time a detour leaving `plan` at plan time `leave` counts as leaving the
     reference at: where plan is on the reference there, or where plan's own detour left it."""
