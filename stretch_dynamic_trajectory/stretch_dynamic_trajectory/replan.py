@@ -62,11 +62,13 @@ def rejoin_time(plan, block_end, margin, reference_duration):
     return float(min(reference_duration, reference + margin))
 
 
-def rejoin_candidates(plan, leave, reference_duration, margin, block=None, spacing=1.0, count=5, match_path=False):
+def rejoin_candidates(plan, leave, reference_duration, margin, block=None, spacing=1.0, count=5, match_path=False,
+                      resume_from=None):
     """Reference times to try rejoining the reference at, leaving `plan` at plan time `leave`:
     from just past a block (block: (start, end, open_ended) plan times, as blocked_run gives),
     or, without one, from just past where the plan is (on a detour: just past where it left the
-    reference, so going straight back is one of them), every `spacing` s, and the goal.
+    reference, so going straight back is one of them, or just past `resume_from`, the reference
+    time nearest where the robot is, nearest_reference_time), every `spacing` s, and the goal.
 
     A block that runs past what was checked: only the goal, or with `match_path` (the
     reference's path matters, not just where it ends) from just past what was checked like any
@@ -78,7 +80,7 @@ def rejoin_candidates(plan, leave, reference_duration, margin, block=None, spaci
         first = (reference_duration if open_ended and not match_path else
                  rejoin_time(plan, end, margin, reference_duration))
     elif here is None:
-        first = min(reference_duration, plan.left + margin)
+        first = min(reference_duration, (plan.left if resume_from is None else resume_from) + margin)
     else:
         first = min(reference_duration, here + margin)
     times = [first + k * spacing for k in range(count) if first + k * spacing < reference_duration]
@@ -119,6 +121,19 @@ def splice(current, tau, leave, detour_times, detour_positions, reference, rejoi
         velocities[k] = current.sample(t)[1]
     return FollowedPlan(Trajectory(times, positions, velocities), detour_end=max(detour_end, 1e-9), rejoin=rejoin,
                         left=left)
+
+
+def nearest_reference_time(reference, q, t0, t1, weights, step=0.05):
+    """The reference time in [t0, t1] where the reference comes nearest configuration q
+    (weighted distance; weights: roughly m of motion per unit of each joint). For a detour, with
+    t0 and t1 where it left and where it rejoins: where to pick the reference back up without
+    going back over what the detour went around, nor (searching only forward of t0) ahead to a
+    later pass near the same place, like a loop's end."""
+    t1 = max(t0, min(t1, reference.duration))
+    times = np.unique(np.r_[np.arange(t0, t1, step), t1])
+    positions = np.array([reference.sample(t)[0] for t in times])
+    distances = np.linalg.norm((positions - np.asarray(q, dtype=float)) * np.asarray(weights, dtype=float), axis=1)
+    return float(times[int(np.argmin(distances))])
 
 
 def plan_time_of(plan, reference_time):

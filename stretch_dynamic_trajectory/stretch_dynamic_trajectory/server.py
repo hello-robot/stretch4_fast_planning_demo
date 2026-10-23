@@ -89,8 +89,8 @@ from stretch_motion_planning_interfaces.srv import CheckMotion, ReplanAround
 
 from stretch_dynamic_trajectory.contact import (CONTACT_SETTINGS, YIELD_SETTINGS, ContactDetector, ContactSettings,
                                                 Yielding)
-from stretch_dynamic_trajectory.replan import (FollowedPlan, blocked_run, detour_start, left_at, path_deviation,
-                                              rejoin_candidates, splice, worth_switching)
+from stretch_dynamic_trajectory.replan import (FollowedPlan, blocked_run, detour_start, left_at, nearest_reference_time,
+                                              path_deviation, rejoin_candidates, splice, worth_switching)
 from stretch_dynamic_trajectory.timing import (CheckResult, ResumeGate, Trajectory, blocked_anywhere, check_times,
                                                creeping_limits, rewind, scale_deceleration, segment_caps, step_scale,
                                                stopping_for_block, target_scale)
@@ -596,8 +596,18 @@ class DynamicTrajectoryActionServer(StretchTrajectoryActionServer):
         horizon = block[0] if block is not None else plan.duration
         leave = detour_start(tau, scale, self.get_param("replan_lookahead"), horizon)
         match_path = self._match_path()
+        # Where the goal's path is picked back up from: where the plan is on it, or, on a
+        # detour, where it left it; with match_path, on a detour, the point on it nearest where
+        # the robot will be (between where the detour left and where it rejoins), so the way back
+        # merges forward instead of going back over what the detour went around (Elaine,
+        # 2026-10-23: it "went diagonally backwards instead of straight to the circle").
+        reference_start = left_at(followed, leave)
+        resume_from = None
+        if match_path and followed.reference_time(leave) is None:
+            resume_from = reference_start = nearest_reference_time(
+                reference, plan.sample(leave)[0], followed.left, followed.rejoin, self._path_weights(joints))
         rejoins = rejoin_candidates(followed, leave, reference.duration, self.get_param("rejoin_margin"), block,
-                                    match_path=match_path)
+                                    match_path=match_path, resume_from=resume_from)
         # The planner's base rotation is from the heading now; the goal's, from its start.
         base_i = joints.index(self.BASE_ROTATION_JOINT) if self.BASE_ROTATION_JOINT in joints else None
         offset = np.zeros(len(joints))
@@ -611,7 +621,7 @@ class DynamicTrajectoryActionServer(StretchTrajectoryActionServer):
                                        max_detours=len(rejoins) if match_path else 0)
         request.current = self._trajectory_msg(plan, joints, leave, plan.duration, offset)
         request.reference = self._trajectory_msg(reference, joints, 0.0, reference.duration, offset, relative=False)
-        replan = _Replan(followed.id, leave, None, offset, start)
+        replan = _Replan(followed.id, leave, None, offset, start, reference_start)
         future = self._replan_client.call_async(request)
         future.add_done_callback(lambda f: replan.finish(f.result()))
         return replan
@@ -625,6 +635,11 @@ class DynamicTrajectoryActionServer(StretchTrajectoryActionServer):
         return JointTrajectory(joint_names=joints, points=[
             JointTrajectoryPoint(positions=[float(v) for v in trajectory.sample(t)[0] - offset],
                                  time_from_start=duration_msg(t - t0 if relative else t)) for t in times])
+
+    @staticmethod
+    def _path_weights(joints):
+        """Roughly m of motion per unit of each joint, for comparing paths."""
+        return np.array([CREEP_LEVERS.get(j, 1.0) for j in joints])
 
     def _match_path(self):
         mode = self.get_param("replan_mode")
@@ -651,12 +666,12 @@ class DynamicTrajectoryActionServer(StretchTrajectoryActionServer):
             return None
         if replan.plan_id != followed.id or tau > replan.leave + 1e-6:
             return None
-        left = left_at(followed, replan.leave)
+        left = replan.reference_start
         detours = [self._detour_plan(response, k, replan, followed, reference, tau, joints, left)
                    for k in range(len(response.detours))]
         blocked = not np.isfinite(response.current_time)
         if self._match_path():
-            weights = np.array([CREEP_LEVERS.get(j, 1.0) for j in joints])
+            weights = self._path_weights(joints)
             until = max([*response.detour_rejoin_times, followed.rejoin if followed.is_detour else left])
             deviations = [path_deviation(d, replan.leave - tau, reference, left, until, weights) for d in detours]
             current = math.inf if blocked else path_deviation(followed, replan.leave, reference, left, until, weights)
@@ -935,8 +950,11 @@ class _Replan:
     where it rejoins the goal's trajectory, the base rotation added back to the answer, and the
     configuration it leaves from), and once done, the planner's response."""
 
-    def __init__(self, plan_id, leave, rejoin, offset, start):
+    def __init__(self, plan_id, leave, rejoin, offset, start, reference_start):
         self.plan_id, self.leave, self.rejoin, self.offset = plan_id, leave, rejoin, offset
+        # The reference time detours count as leaving the goal's trajectory at, and paths are
+        # compared from.
+        self.reference_start = reference_start
         self.start = np.asarray(start, dtype=float)  # where it leaves the plan (the goal's joints)
         self.response = None
         self.done = threading.Event()

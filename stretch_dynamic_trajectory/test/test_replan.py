@@ -4,7 +4,8 @@ import numpy as np
 import pytest
 
 from stretch_dynamic_trajectory.replan import (FollowedPlan, block_ahead, blocked_run, detour_start, left_at,
-                                              path_deviation, rejoin_candidates, rejoin_time, splice, worth_switching)
+                                              nearest_reference_time, path_deviation, rejoin_candidates, rejoin_time,
+                                              splice, worth_switching)
 from stretch_dynamic_trajectory.timing import CheckResult
 from stretch_dynamic_trajectory.timing import Trajectory
 
@@ -166,3 +167,18 @@ def test_a_detour_is_taken_if_its_live_check_is_clear_or_blocked_further_on():
     # Without a check of the plan now, it counts as blocked where the robot is.
     assert worth_switching(check_of([1.0, 1.0, 0.0]), 0.0, None, 2.0)
     assert not worth_switching(check_of([0.0, 1.0]), 0.0, None, 2.0)
+
+
+def test_a_detour_picks_the_path_back_up_nearest_where_it_is_not_where_it_left():
+    # Two loops of a circle; a detour that left at 1 s bulging outward, now beside 2.5 s.
+    ref = circle(turns=2.0)
+    beside = 1.15 * ref.sample(2.5)[0]
+    assert nearest_reference_time(ref, beside, 1.0, 4.0, WEIGHTS) == pytest.approx(2.5, abs=0.06)
+    # Searching only from where it left: not the same place on the second loop (10.5 s).
+    assert nearest_reference_time(ref, beside, 1.0, 4.0, WEIGHTS) < 4.0
+    detour = splice(ref, 1.0, 1.0, [0.0, 1.0, 2.0], [ref.sample(1.0)[0], beside, ref.sample(4.0)[0]], ref, 4.0,
+                    left=1.0)
+    # From just past the nearest point, not just past where it left.
+    times = rejoin_candidates(detour, 1.0, ref.duration, 0.5, match_path=True, resume_from=2.5)
+    assert times[0] == pytest.approx(3.0)
+    assert rejoin_candidates(detour, 1.0, ref.duration, 0.5, match_path=True)[0] == pytest.approx(1.5)
