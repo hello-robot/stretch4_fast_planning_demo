@@ -20,11 +20,13 @@ So contact is a rise in each moving joint's effort over its level in free motion
   checked for settle s after each start.
 - Contact: push more than the joint's threshold over the free level.
 
-Thresholds from the contact tests: 12 points for the arm, lift and wrist yaw; 8 for wrist
-pitch. Pitch going down is firm even at 8, because the unsigned effort misses load that
-gravity helps carry. Going up it carries some gravity (free level about 4.3), and the stop
-Elaine liked came at 13, a rise of 8.7 over that. The wrists' effort comes in steps of about
-4.33, so 8 is two steps. Roll and base rotation aren't checked (Elaine, 2026-10-19).
+Thresholds: 12 points for every checked joint, from the contact tests (2026-10-19) and a
+free-motion session through the dynamic server (2026-10-23). Wrist pitch at 8 tripped with
+nothing touching it: coming up from 0.5 rad down, the gripper's gravity load grows toward
+level, and the wrists' effort comes in steps of about 4.33, so two steps beat 8. With the wrist
+rolled, yaw carries gravity the same way, so both wrist joints use 12 (Elaine, 2026-10-23).
+Pitch going down is firmer than the rest even so, because the unsigned effort misses load that
+gravity helps carry. Roll and base rotation aren't checked (Elaine, 2026-10-19).
 """
 
 import collections
@@ -47,7 +49,7 @@ CONTACT_SETTINGS = {
     "arm_joint": ContactSettings(12.0),
     "lift_joint": ContactSettings(12.0),
     "wrist_yaw_joint": ContactSettings(12.0, signed=False, start_transient=True),
-    "wrist_pitch_joint": ContactSettings(8.0, signed=False, start_transient=True),
+    "wrist_pitch_joint": ContactSettings(12.0, signed=False, start_transient=True),
 }
 
 
