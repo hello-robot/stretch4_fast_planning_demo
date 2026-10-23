@@ -406,7 +406,7 @@ std::vector<StepLimit> MotionCheck::check(
 }
 
 int MotionCheck::first_blocked(
-  const ObstacleGrid & grid, const std::vector<SelfModel> & samples, float theta_slack) const
+  const ObstacleGrid & grid, const std::vector<SelfModel> & samples, float theta_slack, float margin) const
 {
   if (samples.size() < 2) {
     return -1;
@@ -418,6 +418,7 @@ int MotionCheck::first_blocked(
   while (smallest > limits_.clearance_resolution) {
     smallest *= 0.5f;
   }
+  smallest = std::max(smallest, margin);
   const std::vector<Eigen::Vector3i> cuts = piece_cuts(samples, limits_.max_piece);
   std::vector<Piece> a = sample_pieces(samples[0], cuts);
   for (size_t k = 0; k + 1 < samples.size(); ++k) {
@@ -437,12 +438,14 @@ int MotionCheck::first_blocked(
   return -1;
 }
 
-bool MotionCheck::blocked_at(const ObstacleGrid & grid, const SelfModel & body, float theta_slack) const
+bool MotionCheck::blocked_at(
+  const ObstacleGrid & grid, const SelfModel & body, float theta_slack, float margin) const
 {
   float smallest = limits_.max_clearance;
   while (smallest > limits_.clearance_resolution) {
     smallest *= 0.5f;
   }
+  smallest = std::max(smallest, margin);
   const std::vector<Eigen::Vector3i> cuts = piece_cuts({body}, limits_.max_piece);
   for (const Piece & piece : sample_pieces(body, cuts)) {
     const SweptPiece still = sweep(piece, piece, 0.0f, theta_slack);

@@ -34,12 +34,16 @@ from grid_setup import FastPlanningBody, step_braking
 
 
 class GridObstacles:
-    def __init__(self, grid, robot, resolution, max_velocity, limits=None, age=0.0, theta_slack=0.0, coarse=4.0):
+    def __init__(self, grid, robot, resolution, max_velocity, limits=None, age=0.0, theta_slack=0.0, coarse=4.0,
+                 margin=0.0):
         """grid: an og.ObstacleGrid with current labels and tables; robot: grid_setup.RobotShapes
         with the fingers set as they'll be (posed here through a FastPlanningBody, so not shared
         with another thread); resolution, max_velocity: per joint,
         planner order. age (s) and theta_slack (rad) as for MotionCheck.check. coarse: how many
-        times the resolution motion_clear tries first (see there)."""
+        times the resolution motion_clear tries first (see there). margin (m): how close planned
+        motion may come to an obstacle (paths right at check()'s blocked threshold go blocked
+        with the least change in the grid); motion starting within it is held to the threshold
+        only, so the robot can get out of a tight spot."""
         self.grid = grid
         self.robot = robot
         self.pose = FastPlanningBody(robot)
@@ -49,6 +53,7 @@ class GridObstacles:
         self.age = age
         self.theta_slack = theta_slack
         self.coarse = coarse
+        self.margin = margin
         self._bodies = {}  # posed planning bodies by configuration (RRT reuses its nodes)
         self.stats = {"edges": 0, "steps": 0, "pose_s": 0.0, "check_s": 0.0}
 
@@ -85,23 +90,25 @@ class GridObstacles:
         to posing the robot at every sample, so it's checked at `coarse` times the resolution
         first (about 4 cm steps): MotionCheck bounds each step's whole sweep, larger for larger
         steps, so clear there is clear; only a coarse block is checked again at the resolution."""
-        return self._clear(a, b, self.coarse) or (self.coarse > 1.0 and self._clear(a, b, 1.0))
+        margin = self.margin if self.margin > 0.0 and not self.blocked_at(a, self.margin) else 0.0
+        return self._clear(a, b, self.coarse, margin) or (self.coarse > 1.0 and self._clear(a, b, 1.0, margin))
 
-    def _clear(self, a, b, scale):
+    def _clear(self, a, b, scale, margin=0.0):
         qs = self.samples(a, b, scale)
         t0 = time.perf_counter()
         bodies = [self._body(q) for q in qs]
         t1 = time.perf_counter()
-        blocked = self.checker.first_blocked(self.grid, bodies, self.theta_slack)
+        blocked = self.checker.first_blocked(self.grid, bodies, self.theta_slack, margin)
         self.stats["edges"] += 1
         self.stats["steps"] += len(qs) - 1
         self.stats["pose_s"] += t1 - t0
         self.stats["check_s"] += time.perf_counter() - t1
         return blocked < 0
 
-    def blocked_at(self, q):
-        """True if configuration q is already as close to an obstacle as a step's blocked."""
-        return self.checker.blocked_at(self.grid, self._body(q), self.theta_slack)
+    def blocked_at(self, q, margin=0.0):
+        """True if configuration q is already as close to an obstacle as a step's blocked, or
+        within margin."""
+        return self.checker.blocked_at(self.grid, self._body(q), self.theta_slack, margin)
 
     def path_time(self, path):
         """Predicted execution time (s) of a path of waypoints: per step, the larger of its

@@ -1,0 +1,35 @@
+# Detours for the dynamic trajectory server (planner_node.py, replan_around): ways from a point
+# on the plan it's following back onto its goal's trajectory, around the obstacle monitor's grid
+# (a snapshot from get_grid), each with its predicted time to the goal, and the same prediction
+# for the plan it's following. Predicted time: the joints at their top speeds, slower near
+# obstacles and through unknown space or contaminated shadow (stretch_obstacle_grid
+# GridObstacles.path_time); infinite if blocked.
+#
+# Joint positions are in joint_names' order. mobile_base_rotation_joint, if there, is relative
+# to the base's heading now.
+
+string[] joint_names
+# Where detours leave the plan being followed.
+float64[] start
+# The rest of the plan being followed, from start to the goal.
+trajectory_msgs/JointTrajectory current
+# The goal's trajectory, and the times on it (time_from_start) to try rejoining it at.
+trajectory_msgs/JointTrajectory reference
+float64[] rejoin_times
+# Joints not in joint_names may move too (back where they started by the time a detour rejoins).
+bool move_other_joints
+# At most this many detours back, and this many seconds for all of them; 0: the node's defaults.
+uint8 max_detours
+float64 timeout
+---
+bool success
+string message
+# Predicted time to the goal along `current`.
+float64 current_time
+# Detours, fastest (by predicted time to the goal) first: each from start to the reference at
+# rejoin_times[k], timed at the joints' top speeds.
+trajectory_msgs/JointTrajectory[] detours
+float64[] detour_rejoin_times
+float64[] detour_times
+string[] detour_methods
+float64 planning_time

@@ -21,11 +21,13 @@ _ids = itertools.count(1)
 
 @dataclass
 class FollowedPlan:
-    """A plan being followed: the reference itself (detour_end 0), or a detour that rejoins the
-    reference at reference time `rejoin`, reached at plan time detour_end."""
+    """A plan being followed: the reference itself (detour_end 0), or a detour that left the
+    reference at reference time `left` and rejoins it at reference time `rejoin`, reached at
+    plan time detour_end."""
     trajectory: Trajectory
     detour_end: float = 0.0
     rejoin: float = 0.0
+    left: float = 0.0
     id: int = field(default_factory=lambda: next(_ids))
 
     @property
@@ -60,16 +62,34 @@ def rejoin_time(plan, block_end, margin, reference_duration):
     return float(min(reference_duration, reference + margin))
 
 
+def rejoin_candidates(plan, leave, reference_duration, margin, block=None, spacing=1.0, count=5):
+    """Reference times to try rejoining the reference at, leaving `plan` at plan time `leave`:
+    from just past a block (block: (start, end, open_ended) plan times, as blocked_run gives),
+    or, without one, from just past where the plan is (on a detour: just past where it left the
+    reference, so going straight back is one of them), every `spacing` s, and the goal."""
+    here = plan.reference_time(leave)
+    if block is not None:
+        _, end, open_ended = block
+        first = reference_duration if open_ended else rejoin_time(plan, end, margin, reference_duration)
+    elif here is None:
+        first = min(reference_duration, plan.left + margin)
+    else:
+        first = min(reference_duration, here + margin)
+    times = [first + k * spacing for k in range(count) if first + k * spacing < reference_duration]
+    return times + [reference_duration]
+
+
 def detour_start(tau, scale, lookahead, block_start):
     """Plan time to leave the current plan at: lookahead s of trajectory time ahead at the
     current scale (the robot keeps going while the planner works), but before the block."""
     return float(np.clip(tau + scale * lookahead, tau, max(tau, block_start)))
 
 
-def splice(current, tau, leave, detour_times, detour_positions, reference, rejoin, lead_step=0.05):
+def splice(current, tau, leave, detour_times, detour_positions, reference, rejoin, left=0.0, lead_step=0.05):
     """The FollowedPlan to switch to at plan time tau of `current` (a Trajectory): along
     current to plan time `leave`, then the detour (times from 0 at its start, which is current
-    at `leave`), then the reference past reference time `rejoin` (where the detour ends)."""
+    at `leave`), then the reference past reference time `rejoin` (where the detour ends). `left`:
+    the reference time the detour counts as leaving the reference at."""
     lead = list(np.arange(tau, leave, lead_step)) + [leave]
     if len(lead) > 1 and lead[-1] - lead[-2] < 1e-6:
         lead.pop(-2)
@@ -89,4 +109,12 @@ def splice(current, tau, leave, detour_times, detour_positions, reference, rejoi
     velocities = Trajectory(times, positions).velocities.copy()
     for k, t in enumerate(lead):
         velocities[k] = current.sample(t)[1]
-    return FollowedPlan(Trajectory(times, positions, velocities), detour_end=max(detour_end, 1e-9), rejoin=rejoin)
+    return FollowedPlan(Trajectory(times, positions, velocities), detour_end=max(detour_end, 1e-9), rejoin=rejoin,
+                        left=left)
+
+
+def left_at(plan, leave):
+    """The reference time a detour leaving `plan` at plan time `leave` counts as leaving the
+    reference at: where plan is on the reference there, or where plan's own detour left it."""
+    here = plan.reference_time(leave)
+    return plan.left if here is None else here

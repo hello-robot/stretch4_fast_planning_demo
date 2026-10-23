@@ -12,6 +12,13 @@ snapshot from the monitor's get_grid service (about 35 KB, so this node can run 
 robot) into a grid of its own, and checks motion against it as the monitor does
 (stretch_obstacle_grid/tools/grid_planning.py): obstacles block, unknown space and
 contaminated shadow only make a path slower.
+
+replan_around (ReplanAround) serves the dynamic trajectory server: detours from a point on the
+plan it's following back onto its goal's trajectory at several candidate points, each scored
+by predicted time to the goal on one grid snapshot, with the plan it's following scored the
+same way, so the server can pick the fastest (and go back to its goal's trajectory once that's
+fastest again). Scores count the grid only over the next score_horizon s; beyond that, motion
+counts at the joints' top speeds (obstacles that far ahead will have moved by then).
 """
 
 import math
@@ -38,7 +45,7 @@ from sensor_msgs.msg import JointState
 from shape_msgs.msg import SolidPrimitive
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 
-from stretch_motion_planning_interfaces.srv import GetGrid, PlanJointTrajectory
+from stretch_motion_planning_interfaces.srv import GetGrid, PlanJointTrajectory, ReplanAround
 from stretch_motion_planning.collision_model import (
     JOINT_NAMES, StretchCollisionModel, joint_vector, load_config,
 )
@@ -95,6 +102,11 @@ class TrajectoryPlannerNode(Node):
         self.declare_parameter("driver_node", "stretch_driver")
         self.declare_parameter("planning_scene_service", "/get_planning_scene")
         self.declare_parameter("grid_service", "get_grid")
+        self.declare_parameter("replan_timeout", 0.5)
+        self.declare_parameter("max_detours", 4)
+        self.declare_parameter("score_horizon", 4.0)
+        # m: how close planned motion may come to the grid's obstacles (see GridObstacles).
+        self.declare_parameter("obstacle_margin", 0.05)
 
         config = load_config(self.get_parameter("config_file").value)
         self.collision = StretchCollisionModel(config)
@@ -119,8 +131,9 @@ class TrajectoryPlannerNode(Node):
         self.grid_client = None
         self.grid_copy = None  # (grid config, og.ObstacleGrid with no LiDARs), made on first use
         self.grid_robot = None
-        self.create_service(PlanJointTrajectory, "plan_joint_trajectory", self.plan_callback,
-                            callback_group=MutuallyExclusiveCallbackGroup())
+        planning = MutuallyExclusiveCallbackGroup()  # one planning request at a time
+        self.create_service(PlanJointTrajectory, "plan_joint_trajectory", self.plan_callback, callback_group=planning)
+        self.create_service(ReplanAround, "replan_around", self.replan_callback, callback_group=planning)
 
         self.planning_scene_client = None
         self.scene_callback_group = background
@@ -308,7 +321,7 @@ class TrajectoryPlannerNode(Node):
                                f"{age:.2f} s old, base turned {turned:.3f} rad since")
         resolution = joint_vector(self.config["planner"]["check_resolution"])
         return grid_planning.GridObstacles(grid, self.grid_robot, resolution, self.max_velocity, age=age,
-                                           theta_slack=turned)
+                                           theta_slack=turned, margin=self.get_parameter("obstacle_margin").value)
 
     # --- planning ---------------------------------------------------------------------
 
@@ -364,6 +377,122 @@ class TrajectoryPlannerNode(Node):
         self.get_logger().info(
             f"Planned with {result.method} in {result.planning_time * 1000:.1f} ms: "
             f"{len(result.path) - 1} straight-line segments, {times[-1]:.1f} s long")
+
+
+    # --- detours for the dynamic trajectory server ------------------------------------------
+
+    def replan_callback(self, request, response):
+        t0 = time.perf_counter()
+        try:
+            self._replan(request, response)
+            response.success = True
+        except PlanningError as e:
+            response.success, response.message = False, str(e)
+        response.planning_time = time.perf_counter() - t0
+        return response
+
+    def _configurations(self, names, rows, base):
+        """Planner configurations from rows of positions for joints `names`, the rest as in base."""
+        out = []
+        for row in rows:
+            q = base.copy()
+            for name, value in zip(names, row):
+                if name not in JOINT_NAMES:
+                    raise PlanningError(f"Unknown joint '{name}'")
+                q[JOINT_NAMES.index(name)] = value
+            out.append(q)
+        return out
+
+    def _score(self, obstacles, segments):
+        """Predicted time (s) along straight segments (pairs of configurations, or callables
+        giving (pair, grid time) for cached ones), all counted from the same start: on the grid
+        for the first score_horizon s of nominal motion, at the joints' top speeds after that,
+        so a far-off stretch counts the same whichever option it's part of."""
+        horizon = self.get_parameter("score_horizon").value
+        total, nominal_so_far = 0.0, 0.0
+        for segment in segments:
+            (a, b), grid_time = segment() if callable(segment) else (segment, None)
+            nominal = float(np.max(np.abs(b - a) / self.max_velocity))
+            if nominal_so_far < horizon:
+                total += obstacles.path_time([a, b]) if grid_time is None else grid_time()
+            else:
+                total += nominal
+            nominal_so_far += nominal
+            if not math.isfinite(total):
+                return math.inf
+        return total
+
+    def _replan(self, request, response):
+        names = list(request.joint_names)
+        base = self.current_configuration()
+        start = self._configurations(names, [request.start], base)[0]
+        reference_names = list(request.reference.joint_names) or names
+        reference = self._configurations(reference_names, [p.positions for p in request.reference.points], start)
+        reference_t = np.array([p.time_from_start.sec + p.time_from_start.nanosec * 1e-9 for p in request.reference.points])
+        current = self._configurations(list(request.current.joint_names) or names,
+                                       [p.positions for p in request.current.points], start)
+        if not reference or not current:
+            raise PlanningError("Empty current or reference trajectory")
+
+        obstacles = self.grid_obstacles()
+        self.planner.obstacles = obstacles
+        self.collision.set_obstacles([])
+        active = np.array([name in names for name in JOINT_NAMES]) if not request.move_other_joints else np.ones(len(JOINT_NAMES), bool)
+        if "mobile_base_rotation_joint" not in names:
+            active[THETA] = False
+
+        path = [start] + current
+        response.current_time = self._score(obstacles, list(zip(path[:-1], path[1:])))
+        # The reference's segments, with their grid times worked out once, when first needed.
+        cache = {}
+
+        def reference_segment(k):
+            def segment():
+                def grid_time():
+                    if k not in cache:
+                        cache[k] = obstacles.path_time([reference[k], reference[k + 1]])
+                    return cache[k]
+                return (reference[k], reference[k + 1]), grid_time
+            return segment
+
+        timeout = request.timeout or self.get_parameter("replan_timeout").value
+        max_detours = request.max_detours or self.get_parameter("max_detours").value
+        deadline = time.perf_counter() + timeout
+        found = []
+        targets = sorted(set(float(t) for t in request.rejoin_times))
+        for k, rejoin in enumerate(targets):
+            remaining = deadline - time.perf_counter()
+            if remaining <= 0.0:
+                break
+            # The reference at the rejoin time (between waypoints, linearly), then its rest.
+            i = int(np.clip(np.searchsorted(reference_t, rejoin, side="right") - 1, 0, len(reference_t) - 1))
+            if i + 1 < len(reference_t) and reference_t[i + 1] > reference_t[i]:
+                f = (rejoin - reference_t[i]) / (reference_t[i + 1] - reference_t[i])
+                goal = reference[i] + f * (reference[i + 1] - reference[i])
+                rest = [(goal, reference[i + 1])] + [reference_segment(j) for j in range(i + 1, len(reference) - 1)]
+            else:
+                goal = reference[i]
+                rest = [reference_segment(j) for j in range(i, len(reference) - 1)]
+            result = self.planner.plan(start, goal, active, timeout=remaining / (len(targets) - k))
+            if not result.success:
+                continue
+            predicted = self._score(obstacles, list(zip(result.path[:-1], result.path[1:])) + rest)
+            if not math.isfinite(predicted):
+                continue
+            found.append((predicted, rejoin, result))
+        found.sort(key=lambda x: x[0])
+        for predicted, rejoin, result in found[:max_detours]:
+            positions, times = time_path(result.path, self.max_velocity, self.max_acceleration, self.waypoint_spacing)
+            response.detours.append(JointTrajectory(
+                joint_names=list(JOINT_NAMES),
+                points=[JointTrajectoryPoint(positions=[float(v) for v in q], time_from_start=seconds_to_duration(t))
+                        for q, t in zip(positions, times)]))
+            response.detour_rejoin_times.append(rejoin)
+            response.detour_times.append(predicted)
+            response.detour_methods.append(result.method)
+        response.message = (f"{len(found)} detours of {len(targets)} rejoin points; current "
+                            f"{response.current_time:.1f} s, best {found[0][0]:.1f} s" if found else
+                            f"no detour to any of {len(targets)} rejoin points; current {response.current_time:.1f} s")
 
 
 def main(args=None):

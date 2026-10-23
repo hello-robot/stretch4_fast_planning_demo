@@ -1099,3 +1099,17 @@ TEST(MotionCheck, BlockedAtAPoseTouchingAnObstacle)
   EXPECT_TRUE(checker.blocked_at(*labeled, arm_at(scene, 0.55f)));   // into it
 }
 
+TEST(MotionCheck, AMarginBlocksMotionThatComesClose)
+{
+  Scene scene;
+  scene.obstacles.emplace_back(Eigen::Vector3f(1.0f, -0.1f, 0.0f), Eigen::Vector3f(1.1f, 0.1f, 1.0f));
+  const auto labeled = label_scene(scene);
+  std::vector<SelfModel> samples;
+  for (int i = 0; i <= 40; ++i) {samples.push_back(arm_at(scene, 0.01f * i));}  // front face to 0.9: 10 cm short
+  const MotionCheck checker;
+  EXPECT_EQ(checker.first_blocked(*labeled, samples), -1);
+  EXPECT_NE(checker.first_blocked(*labeled, samples, 0.0f, 0.15f), -1);
+  EXPECT_FALSE(checker.blocked_at(*labeled, samples.back()));
+  EXPECT_TRUE(checker.blocked_at(*labeled, samples.back(), 0.0f, 0.15f));
+}
+

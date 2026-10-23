@@ -132,12 +132,15 @@ public:
 
   // The first step check(grid, samples, ..., theta_slack) would call blocked, or -1: the same
   // test, without the clearances and speeds, stopping at the first blocked step. For a planner
-  // that only needs to know whether a motion is clear.
-  int first_blocked(const ObstacleGrid & grid, const std::vector<SelfModel> & samples, float theta_slack = 0.0f) const;
+  // that only needs to know whether a motion is clear. With margin (m) above check()'s
+  // threshold, a step also counts as blocked within margin of an obstacle.
+  int first_blocked(const ObstacleGrid & grid, const std::vector<SelfModel> & samples, float theta_slack = 0.0f,
+    float margin = 0.0f) const;
 
   // True if the robot posed as `body` is already as close to an obstacle as check() calls
-  // blocked (a start or goal a planner can't use).
-  bool blocked_at(const ObstacleGrid & grid, const SelfModel & body, float theta_slack = 0.0f) const;
+  // blocked, or within margin (a start or goal a planner can't use).
+  bool blocked_at(const ObstacleGrid & grid, const SelfModel & body, float theta_slack = 0.0f,
+    float margin = 0.0f) const;
 
   // The voxels behind step `step` of check(grid, samples, ..., theta_slack) being blocked
   // (kObstacles) or unsafe (kUnsafe): for each moving piece with clearance 0, the flagged

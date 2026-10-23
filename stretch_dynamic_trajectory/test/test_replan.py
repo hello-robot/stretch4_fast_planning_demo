@@ -3,7 +3,8 @@
 import numpy as np
 import pytest
 
-from stretch_dynamic_trajectory.replan import FollowedPlan, blocked_run, detour_start, rejoin_time, splice
+from stretch_dynamic_trajectory.replan import (FollowedPlan, blocked_run, detour_start, left_at, rejoin_candidates,
+                                              rejoin_time, splice)
 from stretch_dynamic_trajectory.timing import CheckResult
 from stretch_dynamic_trajectory.timing import Trajectory
 
@@ -62,4 +63,18 @@ def test_the_blocked_run_and_whether_it_goes_past_what_was_checked():
     assert (start, end, open_ended) == (pytest.approx(0.2), pytest.approx(0.5), False)
     check.caps = np.array([1, 1, 1, 1, 1, 1, 1, 0, 0, 0.0])
     assert blocked_run(check)[2]
+
+
+def test_rejoin_candidates_past_a_block_or_back_where_the_detour_left():
+    ref = reference()
+    plan = FollowedPlan(ref)
+    # Blocked from 1.0 to 1.5 on the reference: from 2.0 on, and the goal.
+    assert rejoin_candidates(plan, 0.5, ref.duration, 0.5, block=(1.0, 1.5, False)) == pytest.approx([2.0, 3.0, 4.0])
+    # Blocked past what was checked: only the goal.
+    assert rejoin_candidates(plan, 0.5, ref.duration, 0.5, block=(1.0, 1.5, True)) == pytest.approx([4.0])
+    # On a detour that left at 1.0 for 3.0: going back just past where it left is a candidate.
+    detour = splice(ref, 1.0, 1.0, [0.0, 1.5], [ref.sample(1.0)[0], ref.sample(3.0)[0]], ref, 3.0, left=1.0)
+    assert rejoin_candidates(detour, 0.5, ref.duration, 0.5)[0] == pytest.approx(1.5)
+    assert left_at(detour, 0.5) == pytest.approx(1.0)
+    assert left_at(plan, 0.7) == pytest.approx(0.7)
 

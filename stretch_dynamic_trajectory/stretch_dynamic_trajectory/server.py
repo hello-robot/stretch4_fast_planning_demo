@@ -40,19 +40,23 @@ reporting what happened; "resume" goes back along the plan to where the robot is
 on (into the same thing again, if it's still there), ending the goal after
 contact_resume_limit contacts and pushes in it.
 
-While the checks show a block ahead, the server asks the planner node (plan_joint_trajectory,
-with use_obstacle_grid) for a detour, at most every replan_period s, one at a time: from
-replan_lookahead s ahead on the current plan (at the current speed) back to the goal's
-trajectory rejoin_margin s past the blocked stretch (or to the goal, if the stretch runs past
-what was checked, or the planner found the rejoining point blocked), moving only the goal's
-joints. It
-switches to it at once (replan.py splices the current plan, the detour and the rest of the
-goal's trajectory, starting at the current velocity) and publishes the new plan; without a
-detour it stops and creeps as before. blocked_timeout (s, 0 for none) ends a goal that stays
-blocked that long.
+Replanning (replan, on by default; needs the planner node): while the checks show a block
+ahead, or the robot is on a detour, the server asks the planner node's replan_around, at most
+every replan_period s, one at a time, for detours leaving the plan replan_lookahead s ahead (at
+the current speed) and rejoining the goal's trajectory at several points: from rejoin_margin s
+past the blocked stretch (or, on a detour, from just past where it left the goal's trajectory,
+so going straight back is one option) to the goal. The planner scores each, and the plan being
+followed, by predicted time to the goal on one snapshot of the obstacle grid; the server
+switches to the fastest if it beats the plan it's following by switch_margin s (always, if
+that's blocked). replan.py splices the current plan up to the leaving point, the detour and the
+rest of the goal's trajectory, starting at the current velocity, and the new plan is
+published. Detours move only the goal's joints, unless replan_joints is "all": then the server
+takes over every joint (the others held where they are, in velocity mode; base rotation only
+with allow_rotation) and a detour may move them, back where they were by the time it rejoins.
+Without a detour the robot stops and creeps as before. blocked_timeout (s, 0 for none) ends a
+goal that stays blocked that long.
 
-Not yet: going back to the goal's trajectory when it clears, several alternatives at once, and
-dodging while holding a position.
+Not yet: dodging while holding a position.
 """
 
 import threading
@@ -70,17 +74,20 @@ from std_msgs.msg import Header
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 
 from hello_helpers.stretch4_ros_api import StretchTrajectoryActionServer
-from stretch_motion_planning_interfaces.srv import CheckMotion, PlanJointTrajectory
+from stretch_motion_planning_interfaces.srv import CheckMotion, ReplanAround
 
 from stretch_dynamic_trajectory.contact import (CONTACT_SETTINGS, YIELD_SETTINGS, ContactDetector, ContactSettings,
                                                 Yielding)
-from stretch_dynamic_trajectory.replan import FollowedPlan, blocked_run, detour_start, rejoin_time, splice
+from stretch_dynamic_trajectory.replan import FollowedPlan, blocked_run, detour_start, left_at, rejoin_candidates, splice
 from stretch_dynamic_trajectory.timing import (CheckResult, ResumeGate, Trajectory, blocked_anywhere, check_times,
                                                creeping_limits, rewind, scale_deceleration, segment_caps, step_scale,
                                                stopping_for_block, target_scale)
 
 WRIST_JOINTS = ("wrist_yaw_joint", "wrist_pitch_joint", "wrist_roll_joint")
 STILL_SPEED = 1e-3  # planned joint speed (units/s) under which a joint counts as held
+# The joints detours may move with replan_joints "all" (the planner's).
+REPLAN_JOINTS = ("mobile_base_rotation_joint", "lift_joint", "arm_joint", "wrist_yaw_joint", "wrist_pitch_joint",
+                 "wrist_roll_joint")
 # m a point of the robot moves per unit of each joint's motion, at most, for bounding the
 # fastest point's speed while creeping: the robot's reach for base rotation (arm out 0.55 m plus
 # the gripper), the gripper's length for the wrist joints, and 1 for everything else.
@@ -101,7 +108,6 @@ class DynamicTrajectoryActionServer(StretchTrajectoryActionServer):
         self._check_lock = threading.Lock()
         self._state = None  # (FollowedPlan, tau, positions) shared with the check thread
         self._check_now = threading.Event()  # wakes the check thread (a new plan to check)
-        self._rejoin_blocked = None  # the plan whose rejoining point the planner found blocked
         self._base_reference_stamp = None  # when the goal's base rotation is measured from
         self._held = False  # whether the resume gate holds the robot, for the check thread
         self._sensitivity = None
@@ -110,8 +116,8 @@ class DynamicTrajectoryActionServer(StretchTrajectoryActionServer):
                          diagnostics_namespace="dynamic_trajectory_server_diagnostics")
         self._check_client = driver.create_client(CheckMotion, "check_motion",
                                                   callback_group=MutuallyExclusiveCallbackGroup())
-        self._plan_client = driver.create_client(PlanJointTrajectory, "plan_joint_trajectory",
-                                                 callback_group=MutuallyExclusiveCallbackGroup())
+        self._replan_client = driver.create_client(ReplanAround, "replan_around",
+                                                   callback_group=MutuallyExclusiveCallbackGroup())
         self._pub_timing = driver.create_publisher(JointState, "dynamic_trajectory_server_diagnostics/timing", 10)
         self._pub_check = driver.create_publisher(DiagnosticArray, "dynamic_trajectory_server_diagnostics/check", 10)
         self._pub_plan = driver.create_publisher(
@@ -160,12 +166,15 @@ class DynamicTrajectoryActionServer(StretchTrajectoryActionServer):
         add_param("back_off_speed", 0.02)
         add_param("contact_hold", 2.0)
         add_param("contact_resume_limit", 3)
-        # Replanning around a block (see the module docstring): requests at most every
-        # replan_period s, a detour leaving replan_lookahead s of trajectory (at the current
-        # speed) ahead, rejoining rejoin_margin s past the block, planned within replan_timeout s.
+        # Replanning (see the module docstring): requests at most every replan_period s, detours
+        # leaving replan_lookahead s of trajectory (at the current speed) ahead, rejoining from
+        # rejoin_margin s past the block, planned within replan_timeout s; switch_margin s
+        # faster than the current plan to switch. replan_joints: "goal" or "all".
         add_param("replan", True)
         add_param("replan_period", 0.5)
         add_param("replan_lookahead", 0.6)
+        add_param("switch_margin", 0.5)
+        add_param("replan_joints", "goal")
         add_param("rejoin_margin", 0.5)
         add_param("replan_timeout", 1.0)
         add_param("blocked_timeout", 0.0)
@@ -226,6 +235,8 @@ class DynamicTrajectoryActionServer(StretchTrajectoryActionServer):
     def _execute(self, goal_handle):
         trajectory = goal_handle.request.trajectory
         trajectory.joint_names = [self.driver.resolve_joint_name(n) for n in trajectory.joint_names]
+        if self.get_param("replan") and self.get_param("replan_joints") == "all":
+            trajectory = self._with_all_joints(trajectory)
         joints = list(trajectory.joint_names)
         if self.BASE_ROTATION_JOINT in joints:
             if not self.get_param("allow_rotation"):
@@ -272,6 +283,24 @@ class DynamicTrajectoryActionServer(StretchTrajectoryActionServer):
             self.active_joints = None
             self._set_sensitivity(self.get_param("safe_sensitivity"))
         return result
+
+    def _with_all_joints(self, trajectory):
+        """The goal with every joint a detour may move added, held where it is now (base
+        rotation only if allowed)."""
+        extra = [j for j in REPLAN_JOINTS if j not in trajectory.joint_names
+                 and (j != self.BASE_ROTATION_JOINT or self.get_param("allow_rotation"))]
+        if not extra:
+            return trajectory
+        if self.BASE_ROTATION_JOINT in extra:
+            self._start_base_rotation()
+        held = [float(self._joint_position(j)) for j in extra]
+        out = JointTrajectory(header=trajectory.header, joint_names=list(trajectory.joint_names) + extra)
+        for point in trajectory.points:
+            out.points.append(JointTrajectoryPoint(
+                positions=list(point.positions) + held,
+                velocities=list(point.velocities) + [0.0] * len(extra) if point.velocities else [],
+                time_from_start=point.time_from_start))
+        return out
 
     def _plan(self, trajectory):
         """The goal as a Trajectory from the robot's current state at trajectory time 0."""
@@ -369,7 +398,7 @@ class DynamicTrajectoryActionServer(StretchTrajectoryActionServer):
 
             # A detour from the planner, if one's ready: switch to it.
             if replan is not None and replan.done.is_set():
-                detour = self._detour(replan, followed, reference, tau, joints)
+                detour = self._best_detour(replan, followed, reference, tau, joints)
                 replan = None
                 if detour is not None:
                     followed, plan, tau = detour, detour.trajectory, 0.0
@@ -385,10 +414,12 @@ class DynamicTrajectoryActionServer(StretchTrajectoryActionServer):
                 gated_stamp = check.stamp
                 gate.update(check.stamp, stopping_for_block(check, target), blocked_anywhere(check))
                 self._held = gate.held
-                # Blocked ahead: ask for a detour (at most every replan_period s, one at a time).
-                if (blocked_anywhere(check) and replan is None and now - last_replan >= self.get_param("replan_period")
-                        and self.get_param("replan")):
-                    replan = self._request_detour(followed, reference, check, tau, scale, joints)
+                # Blocked ahead, or on a detour: ask for detours (at most every replan_period s,
+                # one request at a time).
+                on_detour = followed.is_detour and tau < followed.detour_end
+                if ((blocked_anywhere(check) or on_detour) and replan is None and self.get_param("replan")
+                        and now - last_replan >= self.get_param("replan_period")):
+                    replan = self._request_detours(followed, reference, check, tau, scale, joints)
                     last_replan = now
             blocked_since = (blocked_since or now) if gate.held else None
             blocked_timeout = self.get_param("blocked_timeout")
@@ -520,60 +551,75 @@ class DynamicTrajectoryActionServer(StretchTrajectoryActionServer):
 
     # --- replanning ------------------------------------------------------------------------------
 
-    def _request_detour(self, followed, reference, check, tau, scale, joints):
-        """Ask the planner, in the background, for a detour around the first block in `check`;
-        a _Replan to wait on, or None if there's no planner."""
-        if not self._plan_client.service_is_ready():
-            self.driver.get_logger().warn("No plan_joint_trajectory service: can't replan around blocks",
+    def _request_detours(self, followed, reference, check, tau, scale, joints):
+        """Ask the planner, in the background, for detours from a little ahead back onto the
+        goal's trajectory; a _Replan to wait on, or None if there's no planner."""
+        if not self._replan_client.service_is_ready():
+            self.driver.get_logger().warn("No replan_around service (planner node): can't replan around blocks",
                                           throttle_duration_sec=30.0)
             return None
-        block_start, block_end, open_ended = blocked_run(check)
-        leave = detour_start(tau, scale, self.get_param("replan_lookahead"), block_start)
-        to_goal = open_ended or self._rejoin_blocked == followed.id
-        rejoin = (reference.duration if to_goal else
-                  rejoin_time(followed, block_end, self.get_param("rejoin_margin"), reference.duration))
-        start, goal = followed.trajectory.sample(leave)[0], reference.sample(rejoin)[0]
+        plan = followed.trajectory
+        block = blocked_run(check) if blocked_anywhere(check) else None
+        horizon = block[0] if block is not None else plan.duration
+        leave = detour_start(tau, scale, self.get_param("replan_lookahead"), horizon)
+        rejoins = rejoin_candidates(followed, leave, reference.duration, self.get_param("rejoin_margin"), block)
         # The planner's base rotation is from the heading now; the goal's, from its start.
         base_i = joints.index(self.BASE_ROTATION_JOINT) if self.BASE_ROTATION_JOINT in joints else None
-        base_now = self._joint_position(self.BASE_ROTATION_JOINT) if base_i is not None else 0.0
         offset = np.zeros(len(joints))
         if base_i is not None:
-            offset[base_i] = base_now
-        request = PlanJointTrajectory.Request(move_only_goal_joints=True, use_obstacle_grid=True,
-                                              timeout=self.get_param("replan_timeout"))
-        request.start = JointState(name=joints, position=[float(v) for v in start - offset])
-        request.goal = JointState(name=joints, position=[float(v) for v in goal - offset])
-        replan = _Replan(followed.id, leave, rejoin, offset, start)
-        future = self._plan_client.call_async(request)
+            offset[base_i] = self._joint_position(self.BASE_ROTATION_JOINT)
+        start = plan.sample(leave)[0]
+        request = ReplanAround.Request(joint_names=joints, start=[float(v) for v in start - offset],
+                                       rejoin_times=[float(t) for t in rejoins],
+                                       timeout=self.get_param("replan_timeout"))
+        request.current = self._trajectory_msg(plan, joints, leave, plan.duration, offset)
+        request.reference = self._trajectory_msg(reference, joints, 0.0, reference.duration, offset, relative=False)
+        replan = _Replan(followed.id, leave, None, offset, start)
+        future = self._replan_client.call_async(request)
         future.add_done_callback(lambda f: replan.finish(f.result()))
         return replan
 
-    def _detour(self, replan, followed, reference, tau, joints):
-        """The FollowedPlan to switch to from a planner's answer, or None (no detour, it's for a
-        plan already left, or the robot is already past where it would leave)."""
+    @staticmethod
+    def _trajectory_msg(trajectory, joints, t0, t1, offset, step=0.25, relative=True):
+        """A trajectory sampled every `step` s from t0 to t1 (and its waypoints between), minus
+        `offset`; times from t0 if relative, else as they are."""
+        times = sorted(set(np.r_[np.arange(t0, t1, step), [t1], trajectory.times[(trajectory.times > t0) &
+                                                                                (trajectory.times < t1)]]))
+        return JointTrajectory(joint_names=joints, points=[
+            JointTrajectoryPoint(positions=[float(v) for v in trajectory.sample(t)[0] - offset],
+                                 time_from_start=duration_msg(t - t0 if relative else t)) for t in times])
+
+    def _best_detour(self, replan, followed, reference, tau, joints):
+        """The FollowedPlan to switch to from the planner's answer: its fastest detour, if it
+        beats the plan being followed by switch_margin s; else None (also for an answer about a
+        plan already left, or when the robot is past where the detours leave)."""
         response = replan.response
-        if response is None or not response.success:
+        if response is None or not response.success or not response.detours:
             self.driver.get_logger().info(f"No detour: {response.message if response else 'no answer'}",
                                           throttle_duration_sec=2.0)
-            if response is not None and response.message.startswith("Goal is touching"):
-                self._rejoin_blocked = replan.plan_id  # aim for the goal next time
             return None
         if replan.plan_id != followed.id or tau > replan.leave + 1e-6:
             return None
-        names = list(response.trajectory.joint_names)
+        best = response.detour_times[0]
+        if best > response.current_time - self.get_param("switch_margin"):
+            return None  # the plan being followed is about as fast
+        trajectory = response.detours[0]
+        names = list(trajectory.joint_names)
         times, positions = [], []
-        for point in response.trajectory.points:
+        for point in trajectory.points:
             q = replan.start.copy()
             for k, joint in enumerate(joints):
                 if joint in names:
                     q[k] = point.positions[names.index(joint)] + replan.offset[k]
             times.append(self._msg_seconds(point.time_from_start))
             positions.append(q)
-        detour = splice(followed.trajectory, tau, replan.leave, times, positions, reference, replan.rejoin)
+        rejoin = response.detour_rejoin_times[0]
+        detour = splice(followed.trajectory, tau, replan.leave, times, positions, reference, rejoin,
+                        left=left_at(followed, replan.leave))
         self.driver.get_logger().info(
-            f"Detour ({response.method}, planned in {response.planning_time * 1e3:.0f} ms): leaves at "
-            f"{replan.leave - tau:.2f} s, rejoins the goal's trajectory at {replan.rejoin:.2f} s; "
-            f"{detour.trajectory.duration:.1f} s to go")
+            f"Detour ({response.detour_methods[0]}, {len(response.detours)} found in "
+            f"{response.planning_time * 1e3:.0f} ms): predicted {best:.1f} s to the goal against "
+            f"{response.current_time:.1f} s; rejoins the goal's trajectory at {rejoin:.2f} s")
         return detour
 
     def _contact_watchers(self, joints, levers):
