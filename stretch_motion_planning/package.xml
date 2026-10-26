@@ -12,11 +12,14 @@
 
   <depend>rclpy</depend>
   <depend>sensor_msgs</depend>
+  <depend>nav_msgs</depend>
   <depend>shape_msgs</depend>
   <depend>trajectory_msgs</depend>
   <depend>builtin_interfaces</depend>
   <depend>tf2_ros</depend>
   <depend>stretch_motion_planning_interfaces</depend>
+  <!-- use_obstacle_grid also needs stretch_obstacle_grid at run time (its library and grid tools);
+       not declared, since stretch_obstacle_grid depends on this package. -->
   <!-- Also requires the hello-robot-stretch4-kinematics pip package (pinocchio, coal),
        which has no rosdep key. moveit_msgs is optional (for use_planning_scene). -->
 

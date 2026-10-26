@@ -1,0 +1,26 @@
+# A snapshot of the obstacle monitor's grid to plan against (obstacle_monitor_node.py,
+# get_grid), cropped to the voxels within r_max of the base's axis. The grid's voxels are
+# ordered by radial bin first, so the crop is its first `voxels` voxels.
+
+# m; 0 means the monitor's default (the robot's reach plus a margin).
+float32 r_max
+---
+bool success
+string message
+# Start of the oldest LiDAR frame behind the labels (the monitor's clock), and the base's
+# heading then (odometry, rad).
+builtin_interfaces/Time grid_stamp
+float64 heading
+# The grid's configuration (stretch_obstacle_grid GridConfig), for checking against the
+# planner's own.
+float32 cell
+float32 grid_r_min
+float32 grid_r_max
+float32 z_min
+float32 z_max
+# How many voxels the layers cover (the grid's first ones).
+uint32 voxels
+# zlib-compressed: three bit-packed layers of `voxels` bits each, one after the other
+# (numpy.packbits order): obstacles (occupied or static), moving obstacles (occupied), and
+# unsafe space (unknown or contaminated shadow).
+uint8[] layers
