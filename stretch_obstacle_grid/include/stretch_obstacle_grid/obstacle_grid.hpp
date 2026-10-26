@@ -109,6 +109,16 @@ struct ObstacleGridParams
   // dropped return's beam still got as far as the edge, so the space in front of the edge stays
   // free and only the space behind it is unknown. 0 turns this off.
   float veil_angle = 0.1745f;  // rad (10 deg)
+  // Off the robot's own edges the streaks are longer: the gripper's nearest returns are often
+  // 2-3 cells from its veil points, at a shallower angle (small range gaps; circle bags,
+  // 2026-10-23; they lay 7-29 cm behind it). So returns with a nearer robot return within
+  // self_veil_cells (rings and columns), self_veil_angle, and no more than self_veil_depth
+  // nearer are dropped too, and end on the robot. The depth limit keeps real things farther
+  // behind the robot's edge, which the wide search would otherwise erase next to its outline.
+  // 0 cells turns this off.
+  int self_veil_cells = 3;
+  float self_veil_angle = 0.349f;  // rad (20 deg)
+  float self_veil_depth = 0.3f;    // m
   // Returns nearer than this (m) count as no return: the Hesai's near field is unreliable,
   // and only the robot's own head and mast are this close to the LiDARs.
   float min_return_range = 0.35f;

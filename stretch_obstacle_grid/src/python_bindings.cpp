@@ -174,6 +174,9 @@ PYBIND11_MODULE(stretch_obstacle_grid, m)
   .def_readwrite("min_cluster_size", &ObstacleGridParams::min_cluster_size)
   .def_readwrite("min_cluster_rings", &ObstacleGridParams::min_cluster_rings)
   .def_readwrite("veil_angle", &ObstacleGridParams::veil_angle)
+  .def_readwrite("self_veil_cells", &ObstacleGridParams::self_veil_cells)
+  .def_readwrite("self_veil_angle", &ObstacleGridParams::self_veil_angle)
+  .def_readwrite("self_veil_depth", &ObstacleGridParams::self_veil_depth)
   .def_readwrite("min_return_range", &ObstacleGridParams::min_return_range);
 
   py::enum_<Label>(m, "Label")

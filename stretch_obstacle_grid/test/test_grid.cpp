@@ -716,6 +716,74 @@ TEST(ObstacleGrid, VeilBeamsAreFreeUpToTheEdge)
   EXPECT_EQ(label_scene(scene, no_veil)->range_image(0).hit[cell], Hit::kOther);
 }
 
+TEST(ObstacleGrid, VeilPointsFarOffTheRobotsEdgeAreTheRobots)
+{
+  // Beams 2-3 columns past the arm's side edges come back 15 cm behind it, as off the gripper's
+  // edge in the circle bags (2026-10-23): too far apart for the plain veil filter, so only the
+  // wider search off robot returns drops them. A short arm, so that most of them are well clear
+  // of it (those within self_point_padding are the arm's anyway, so they don't count).
+  Scene scene;
+  scene.arm = Eigen::AlignedBox3f(Eigen::Vector3f(0.5f, -0.05f, 0.85f), Eigen::Vector3f(0.6f, 0.05f, 0.95f));
+  std::vector<float> xyz;
+  std::vector<uint16_t> ring;
+  scene.cast(&xyz, &ring);
+  const int rings = static_cast<int>(Scene::rings().size());
+  const Eigen::Vector3f origin(0.0f, 0.0f, Scene::kHeight);
+  auto direction = [&](int col, int r) {
+      col = (col + Scene::kAzimuthBins) % Scene::kAzimuthBins;
+      return Eigen::Map<const Eigen::Vector3f>(&xyz[3 * (col * rings + r)]).normalized();
+    };
+  std::vector<Eigen::Vector3f> mixed;
+  std::vector<size_t> mixed_cells;
+  for (int col = 0; col < Scene::kAzimuthBins; ++col) {
+    for (int r = 0; r < rings; ++r) {
+      if (Scene::hit_box(origin, direction(col, r), scene.arm)) {
+        continue;
+      }
+      for (int away : {2, 3}) {
+        const bool next_is_arm = Scene::hit_box(origin, direction(col + (away == 2 ? 1 : 2), r), scene.arm) ||
+          Scene::hit_box(origin, direction(col - (away == 2 ? 1 : 2), r), scene.arm);
+        std::optional<float> edge = Scene::hit_box(origin, direction(col + away, r), scene.arm);
+        if (!edge) {
+          edge = Scene::hit_box(origin, direction(col - away, r), scene.arm);
+        }
+        if (edge && !next_is_arm) {
+          const Eigen::Vector3f p = direction(col, r) * (*edge + 0.15f);
+          if (scene.arm.exteriorDistance(p + origin) < 0.04f) {
+            break;
+          }
+          std::copy(p.data(), p.data() + 3, &xyz[3 * (col * rings + r)]);
+          mixed.push_back(p + origin);
+          mixed_cells.push_back(static_cast<size_t>(r) * Scene::kAzimuthBins + col);
+          break;
+        }
+      }
+    }
+  }
+  ASSERT_GT(mixed.size(), 20u);
+  const SelfModel self = scene.self();
+  auto occupied_mixed = [&](int self_veil_cells) {
+      ObstacleGridParams params;
+      params.self_veil_cells = self_veil_cells;
+      params.graze_margin = 0.0f;  // which catches those 2 columns out
+      ObstacleGrid og(scene_config(), {scene.lidar()}, params);
+      og.add_frame(0, xyz.data(), ring.data(), ring.size(), 0.0, self);
+      og.update(self);
+      int occupied = 0;
+      for (const auto & m : mixed) {
+        occupied += label_at(og, m.x(), m.y(), m.z()) == kOccupied;
+      }
+      if (self_veil_cells > 0) {
+        for (size_t cell : mixed_cells) {
+          EXPECT_EQ(og.range_image(0).hit[cell], Hit::kSelf);  // the beam ended on the arm
+        }
+      }
+      return occupied;
+    };
+  EXPECT_EQ(occupied_mixed(3), 0);
+  EXPECT_GT(occupied_mixed(0), 0);  // they'd be obstacles without it
+}
+
 // Frames of a scene with a post that stays put in the world while the base turns `yaw_rate`
 // (rad/s), one frame every 0.1 s from t = 0 to `duration`. Returns the grid after the last.
 std::unique_ptr<ObstacleGrid> watch_post(float yaw_rate, float duration, float post_appears = 0.0f)

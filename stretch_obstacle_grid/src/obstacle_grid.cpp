@@ -182,6 +182,7 @@ void ObstacleGrid::drop_veil_points(const float * xyz, int rows, int cols, Range
   }
   auto point = [&](int32_t i) {return Eigen::Map<const Eigen::Vector3f>(&xyz[3 * i]);};
   const float cos_angle = std::cos(params_.veil_angle);
+  const float cos_self_angle = std::cos(params_.self_veil_angle);
   std::vector<float> & veil = veil_range_;
   veil.assign(nearest_in_cell_.size(), std::numeric_limits<float>::quiet_NaN());
   veil_off_robot_.assign(nearest_in_cell_.size(), 0);
@@ -196,26 +197,40 @@ void ObstacleGrid::drop_veil_points(const float * xyz, int rows, int cols, Range
       }
       const Eigen::Vector3f p = point(a);
       const Eigen::Vector3f toward_lidar = -p.normalized();
-      for (int dr = -1; dr <= 1 && std::isnan(veil[row * cols + col]); ++dr) {
-        if (row + dr < 0 || row + dr >= rows) {
-          continue;
-        }
-        for (int dc = -1; dc <= 1; ++dc) {
-          const size_t other = static_cast<size_t>(row + dr) * cols + (col + dc + cols) % cols;
-          const int32_t b = nearest_in_cell_[other];
-          if (b < 0 || b == a || point(b).squaredNorm() >= p.squaredNorm()) {
-            continue;  // only nearer neighbors can hide this one
+      // Whether a nearer return within `reach` cells (only the robot's no more than
+      // self_veil_depth nearer, if `self_only`) lies within the angle whose cosine is `cos_max`
+      // of straight along this beam; if so, marks this return a veil point off it.
+      const float range = p.norm();
+      auto hidden_by = [&](int reach, float cos_max, bool self_only) {
+          for (int dr = -reach; dr <= reach; ++dr) {
+            if (row + dr < 0 || row + dr >= rows) {
+              continue;
+            }
+            for (int dc = -reach; dc <= reach; ++dc) {
+              const size_t other = static_cast<size_t>(row + dr) * cols + (col + dc + cols) % cols;
+              const int32_t b = nearest_in_cell_[other];
+              const bool robot = image->hit[other] == Hit::kSelf;
+              if (b < 0 || b == a || (self_only && !robot) || point(b).squaredNorm() >= p.squaredNorm()) {
+                continue;  // only nearer neighbors can hide this one
+              }
+              if (robot && image->range[other] < point(b).norm() - params_.range_margin) {
+                continue;  // a ghost: nothing is really there
+              }
+              if (self_only && point(b).norm() < range - params_.self_veil_depth) {
+                continue;  // too far behind the robot's edge to be a mix of it
+              }
+              const Eigen::Vector3f to_neighbor = point(b) - p;
+              if (toward_lidar.dot(to_neighbor) > cos_max * to_neighbor.norm()) {
+                veil[row * cols + col] = point(b).norm();
+                veil_off_robot_[row * cols + col] = robot;
+                return true;
+              }
+            }
           }
-          if (image->hit[other] == Hit::kSelf && image->range[other] < point(b).norm() - params_.range_margin) {
-            continue;  // a ghost: nothing is really there
-          }
-          const Eigen::Vector3f to_neighbor = point(b) - p;
-          if (toward_lidar.dot(to_neighbor) > cos_angle * to_neighbor.norm()) {
-            veil[row * cols + col] = point(b).norm();
-            veil_off_robot_[row * cols + col] = image->hit[other] == Hit::kSelf;
-            break;
-          }
-        }
+          return false;
+        };
+      if (!hidden_by(1, cos_angle, false) && params_.self_veil_cells > 0) {
+        hidden_by(params_.self_veil_cells, cos_self_angle, true);
       }
     }
   }
